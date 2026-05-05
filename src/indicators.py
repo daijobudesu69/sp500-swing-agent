@@ -1,7 +1,11 @@
 """
 Technical indicators module — traditional + Smart Money Concepts (SMC).
 
-Traditional: RSI, MACD, SMA, ATR, Volume metrics
+v2 changes:
+- Added Golden Cross / Death Cross detection (20MA over 50MA)
+- Added sma_20_above_50 current state field
+
+Traditional: RSI, MACD, SMA, ATR, Volume metrics, Golden/Death Cross
 SMC: Swing detection, Order Blocks, FVG, BOS/CHoCH, Liquidity Sweeps,
      Premium/Discount zones, Multi-TF alignment
 """
@@ -63,12 +67,73 @@ def volume_metrics(df: pd.DataFrame, lookback: int = 20) -> Dict[str, float]:
     vol = df["volume"]
     avg_vol = vol.rolling(lookback).mean()
     current_vol = float(vol.iloc[-1])
-    avg_20d = float(avg_vol.iloc[-1]) if not avg_vol.iloc[-1] != avg_vol.iloc[-1] else 0
+    avg_20d = float(avg_vol.iloc[-1]) if not pd.isna(avg_vol.iloc[-1]) else 0
     return {
         "current_volume": current_vol,
         "avg_20d_volume": avg_20d,
         "volume_ratio": current_vol / avg_20d if avg_20d > 0 else 0,
         "is_surge": (current_vol / avg_20d) >= config.VOLUME_SURGE_MULTIPLIER if avg_20d > 0 else False,
+    }
+
+
+def detect_ma_crosses(sma_fast: pd.Series, sma_slow: pd.Series,
+                      lookback: int = 10) -> Dict[str, bool]:
+    """
+    Detect golden cross (fast MA crossed above slow MA) and death cross
+    within the last `lookback` bars.
+
+    Golden cross: bullish — fast MA was below slow MA, now above
+    Death cross: bearish — fast MA was above slow MA, now below
+    """
+    golden_cross_recent = False
+    death_cross_recent = False
+
+    if len(sma_fast) < 2 or len(sma_slow) < 2:
+        return {
+            "golden_cross_recent": False,
+            "death_cross_recent": False,
+            "fast_above_slow": False,
+        }
+
+    # Limit lookback to available data
+    actual_lookback = min(lookback, len(sma_fast) - 1)
+
+    for i in range(1, actual_lookback + 1):
+        try:
+            current_fast = sma_fast.iloc[-i]
+            current_slow = sma_slow.iloc[-i]
+            prev_fast = sma_fast.iloc[-i - 1]
+            prev_slow = sma_slow.iloc[-i - 1]
+
+            # Skip if any value is NaN
+            if pd.isna(current_fast) or pd.isna(current_slow) or \
+               pd.isna(prev_fast) or pd.isna(prev_slow):
+                continue
+
+            # Golden cross: was below or equal, now above
+            if current_fast > current_slow and prev_fast <= prev_slow:
+                golden_cross_recent = True
+
+            # Death cross: was above or equal, now below
+            if current_fast < current_slow and prev_fast >= prev_slow:
+                death_cross_recent = True
+        except (IndexError, KeyError):
+            continue
+
+    # Current state
+    fast_above_slow = False
+    try:
+        latest_fast = sma_fast.iloc[-1]
+        latest_slow = sma_slow.iloc[-1]
+        if not pd.isna(latest_fast) and not pd.isna(latest_slow):
+            fast_above_slow = float(latest_fast) > float(latest_slow)
+    except (IndexError, KeyError):
+        pass
+
+    return {
+        "golden_cross_recent": golden_cross_recent,
+        "death_cross_recent": death_cross_recent,
+        "fast_above_slow": fast_above_slow,
     }
 
 
@@ -99,6 +164,12 @@ def compute_traditional_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             macd_cross_recent = True
             break
 
+    # Golden Cross / Death Cross detection (20MA vs 50MA)
+    ma_cross_data = detect_ma_crosses(
+        sma_20, sma_50,
+        lookback=config.GOLDEN_CROSS_LOOKBACK_BARS
+    )
+
     return {
         "price": current_price,
         "rsi": current_rsi,
@@ -115,6 +186,9 @@ def compute_traditional_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         "above_sma_20": current_price > float(sma_20.iloc[-1]),
         "above_sma_50": current_price > float(sma_50.iloc[-1]),
         "above_sma_200": current_price > float(sma_200.iloc[-1]),
+        "sma_20_above_50": ma_cross_data["fast_above_slow"],
+        "golden_cross_10d": ma_cross_data["golden_cross_recent"],
+        "death_cross_10d": ma_cross_data["death_cross_recent"],
         "volume_metrics": volume_metrics(df, lookback=20),
     }
 
@@ -129,7 +203,7 @@ def _classify_rsi(rsi_val: float) -> str:
         return "chasing_risk"
     if rsi_val <= config.RSI_NEUTRAL_LOW:
         return "weak"
-    return "neutral_bullish"  # 40-65 = ideal swing long zone
+    return "neutral_bullish"
 
 
 # ============================================================
@@ -140,7 +214,6 @@ def find_swing_points(df: pd.DataFrame, lookback: int = 5) -> Dict[str, List[int
     """
     Find pivot highs and lows. A pivot is confirmed if `lookback` bars on each
     side are lower (for high) or higher (for low) than the pivot bar.
-    Returns indices of swing points.
     """
     highs = df["high"].values
     lows = df["low"].values
@@ -148,13 +221,11 @@ def find_swing_points(df: pd.DataFrame, lookback: int = 5) -> Dict[str, List[int
     swing_lows = []
 
     for i in range(lookback, len(df) - lookback):
-        # Pivot high check
         is_pivot_high = all(highs[i] >= highs[i - j] for j in range(1, lookback + 1)) and \
                         all(highs[i] >= highs[i + j] for j in range(1, lookback + 1))
         if is_pivot_high:
             swing_highs.append(i)
 
-        # Pivot low check
         is_pivot_low = all(lows[i] <= lows[i - j] for j in range(1, lookback + 1)) and \
                        all(lows[i] <= lows[i + j] for j in range(1, lookback + 1))
         if is_pivot_low:
@@ -170,8 +241,6 @@ def find_swing_points(df: pd.DataFrame, lookback: int = 5) -> Dict[str, List[int
 def find_order_blocks(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
     """
     Bullish Order Block = last DOWN candle before strong UP move.
-    Marks zone where institutional buy orders likely sit.
-    Returns active OBs (not yet invalidated).
     """
     obs = []
     lookback_bars = min(config.SMC_OB_LOOKBACK_BARS, len(df) - 5)
@@ -180,7 +249,6 @@ def find_order_blocks(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
     for i in range(len(df) - lookback_bars, len(df) - 3):
         if i < 1:
             continue
-        # Look for impulsive UP move starting at i+1
         candle_open = df["open"].iloc[i + 1]
         impulse_high = df["high"].iloc[i + 1:i + 4].max()
         atr_val = atr_series.iloc[i] if not pd.isna(atr_series.iloc[i]) else 0
@@ -189,19 +257,16 @@ def find_order_blocks(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
         move_size = (impulse_high - candle_open) / atr_val
         if move_size < min_move:
             continue
-        # Previous candle (i) must be bearish (close < open)
         if df["close"].iloc[i] >= df["open"].iloc[i]:
             continue
-        # That bearish candle = bullish OB zone
         ob_high = float(df["high"].iloc[i])
         ob_low = float(df["low"].iloc[i])
-        # Check if still valid (price hasn't broken below OB low)
         bars_since = len(df) - 1 - i
         if bars_since > config.SMC_OB_VALIDITY_BARS:
             continue
         subsequent_lows = df["low"].iloc[i + 1:].min()
         if subsequent_lows < ob_low:
-            continue  # OB invalidated
+            continue
         obs.append({
             "type": "bullish_OB",
             "bar_index": i,
@@ -221,7 +286,6 @@ def find_order_blocks(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
 def find_fair_value_gaps(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
     """
     Bullish FVG = 3-candle pattern where candle 3's low > candle 1's high.
-    The "gap" between them is unfilled liquidity that often acts as support.
     """
     fvgs = []
     lookback = min(config.SMC_FVG_LOOKBACK_BARS, len(df) - 3)
@@ -233,7 +297,7 @@ def find_fair_value_gaps(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
         c1_high = df["high"].iloc[i]
         c3_low = df["low"].iloc[i + 2]
         if c3_low <= c1_high:
-            continue  # no gap
+            continue
         gap_size = c3_low - c1_high
         atr_val = atr_series.iloc[i + 2] if not pd.isna(atr_series.iloc[i + 2]) else 0
         if atr_val == 0:
@@ -241,12 +305,11 @@ def find_fair_value_gaps(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
         gap_atr = gap_size / atr_val
         if gap_atr < min_size_atr:
             continue
-        # Check if FVG still unfilled (price hasn't dipped into the gap)
         subsequent_lows = df["low"].iloc[i + 3:].min() if i + 3 < len(df) else c3_low
         is_filled = subsequent_lows < c1_high
         fvgs.append({
             "type": "bullish_FVG",
-            "bar_index": i + 1,  # middle candle
+            "bar_index": i + 1,
             "gap_low": float(c1_high),
             "gap_high": float(c3_low),
             "gap_mid": float((c1_high + c3_low) / 2),
@@ -254,7 +317,6 @@ def find_fair_value_gaps(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
             "is_filled": bool(is_filled),
             "bars_since_formed": len(df) - 1 - (i + 1),
         })
-    # Return only unfilled ones (relevant for entries)
     return [f for f in fvgs if not f["is_filled"]]
 
 
@@ -264,8 +326,8 @@ def find_fair_value_gaps(df: pd.DataFrame, atr_series: pd.Series) -> List[Dict]:
 
 def detect_bos_choch(df: pd.DataFrame, swing_data: Dict) -> Dict:
     """
-    BOS = Break of Structure: price breaks prior swing high (uptrend continuation).
-    CHoCH = Change of Character: price breaks prior swing low (trend reversal).
+    BOS = price breaks prior swing high (uptrend continuation).
+    CHoCH = price breaks prior swing low (trend reversal).
     """
     swing_highs = swing_data["swing_highs"]
     swing_lows = swing_data["swing_lows"]
@@ -277,7 +339,6 @@ def detect_bos_choch(df: pd.DataFrame, swing_data: Dict) -> Dict:
     last_swing_low_idx = swing_lows[-1]
     last_swing_low = df["low"].iloc[last_swing_low_idx]
 
-    # Check for BOS: did price close above last swing high after it formed?
     bos_bullish = False
     bars_after_swing = df.iloc[last_swing_high_idx + 1:]
     if len(bars_after_swing) > 0:
@@ -286,7 +347,6 @@ def detect_bos_choch(df: pd.DataFrame, swing_data: Dict) -> Dict:
         else:
             bos_bullish = bool((bars_after_swing["high"] > last_swing_high).any())
 
-    # CHoCH bearish: price closed below last swing low (only relevant if uptrend prior)
     choch_bearish = False
     bars_after_swing_low = df.iloc[last_swing_low_idx + 1:]
     if len(bars_after_swing_low) > 0:
@@ -309,7 +369,7 @@ def detect_bos_choch(df: pd.DataFrame, swing_data: Dict) -> Dict:
 def detect_liquidity_sweep(df: pd.DataFrame, swing_data: Dict, lookback: int = 10) -> Dict:
     """
     Liquidity sweep = wick spikes through prior swing low (grabbing stops)
-    then closes back above it. Often precedes reversal up.
+    then closes back above it.
     """
     if len(swing_data["swing_lows"]) == 0:
         return {"liquidity_sweep_bullish": False}
@@ -317,7 +377,6 @@ def detect_liquidity_sweep(df: pd.DataFrame, swing_data: Dict, lookback: int = 1
     last_swing_low_idx = swing_data["swing_lows"][-1]
     last_swing_low = df["low"].iloc[last_swing_low_idx]
 
-    # Check last `lookback` bars for sweep pattern
     recent = df.tail(lookback)
     sweep_detected = False
     sweep_bar_idx = None
@@ -348,9 +407,8 @@ def detect_liquidity_sweep(df: pd.DataFrame, swing_data: Dict, lookback: int = 1
 
 def classify_premium_discount(df: pd.DataFrame, swing_data: Dict) -> Dict:
     """
-    Premium = price above 0.5 fib of recent swing range (avoid longs).
-    Discount = price below 0.5 fib (favor longs).
-    Uses last major swing high vs swing low.
+    Premium = above 0.5 fib of recent swing range (avoid longs).
+    Discount = below 0.5 fib (favor longs).
     """
     if len(swing_data["swing_highs"]) == 0 or len(swing_data["swing_lows"]) == 0:
         return {"zone": "unknown"}
@@ -358,7 +416,6 @@ def classify_premium_discount(df: pd.DataFrame, swing_data: Dict) -> Dict:
     last_high_idx = swing_data["swing_highs"][-1]
     last_low_idx = swing_data["swing_lows"][-1]
 
-    # Use the most recent swing range
     swing_high = float(df["high"].iloc[last_high_idx])
     swing_low = float(df["low"].iloc[last_low_idx])
 
@@ -448,7 +505,6 @@ def assess_mtf_alignment(tf_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
             "sma_20": float(sma_20_val) if not pd.isna(sma_20_val) else None,
         }
 
-    # Overall alignment score
     htf_trends = [out.get(tf, {}).get("trend") for tf in ["1wk", "1d"]]
     htf_aligned_bullish = all(t == "uptrend" for t in htf_trends if t != "unknown")
     out["htf_aligned_bullish"] = htf_aligned_bullish
