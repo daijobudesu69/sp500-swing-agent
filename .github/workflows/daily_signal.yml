@@ -1,16 +1,18 @@
-name: Daily Swing Signal — 7PM Jakarta
+name: Daily Swing Signal — 8:30 AM Jakarta
 
 on:
   schedule:
-    # 7 PM Jakarta = 12:00 UTC, weekdays (Mon-Fri)
-    # GitHub Actions cron has ±5 min jitter — that's fine for our use case
-    - cron: '0 12 * * 1-5'
-  workflow_dispatch:  # allow manual trigger from Actions tab
+    # Primary: 01:30 UTC = 8:30 AM Jakarta
+    # Days: Tue-Sat Jakarta = covers Mon-Fri US trading sessions
+    - cron: '30 1 * * 2-6'
+    # Backup: 02:00 UTC = 9:00 AM Jakarta (safety net for cron jitter)
+    - cron: '0 2 * * 2-6'
+  workflow_dispatch:  # manual trigger from Actions tab
 
 jobs:
   run-daily-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 25  # generous buffer; pipeline usually 6-9 min
+    timeout-minutes: 25
     
     steps:
       - name: Checkout repository
