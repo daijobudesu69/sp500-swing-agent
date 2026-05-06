@@ -1,12 +1,11 @@
-name: Daily Swing Signal — 8:30 AM Jakarta
+name: Daily Swing Signal — Morning Jakarta
 
 on:
   schedule:
-    # Primary: 01:30 UTC = 8:30 AM Jakarta
-    # Days: Tue-Sat Jakarta = covers Mon-Fri US trading sessions
+    # Primary: 01:00 UTC = 8:00 AM Jakarta
+    - cron: '0 1 * * 2-6'
+    # Backup: 01:30 UTC = 8:30 AM Jakarta (safety net for cron jitter)
     - cron: '30 1 * * 2-6'
-    # Backup: 02:00 UTC = 9:00 AM Jakarta (safety net for cron jitter)
-    - cron: '0 2 * * 2-6'
   workflow_dispatch:  # manual trigger from Actions tab
 
 jobs:
