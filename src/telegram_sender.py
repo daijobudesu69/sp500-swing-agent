@@ -1,6 +1,9 @@
 """
 Telegram sender — formats signals and pushes to user's chat.
 
+v2 changes:
+- Updated "Next scan" text to reflect new 8AM WIB schedule
+
 Message types:
   1. Daily signals (3-5 trades)
   2. No-signal day (skip with explanation)
@@ -106,7 +109,7 @@ def format_daily_signals(signals: List[Dict[str, Any]], macro_context: Dict[str,
     lines.extend([
         "",
         "_Auto-logged to Sheet_",
-        f"_Next scan: tomorrow 7PM WIB_",
+        f"_Next scan: tomorrow 8AM WIB_",
     ])
 
     return "\n".join(lines)
@@ -190,7 +193,7 @@ def _format_macro_block(macro: Dict[str, Any]) -> str:
         regime = "Mixed / Choppy"
 
     return f"""{config.MACRO_ALERT_EMOJI} *MACRO REGIME:* {regime}
-  VIX `{vix:.1f}` | SPY 5d: `{spy_5d:+.2f}%`
+  VIX `{vix:.2f}` | SPY 5d: `{spy_5d:+.2f}%`
   Above 200MA: `{spy_above}`"""
 
 
@@ -214,7 +217,7 @@ def format_no_signal_day(reason: str, macro_context: Dict[str, Any]) -> str:
 _Better to sit out than force a trade.
 Discipline > activity._
 
-_Next scan: tomorrow 7PM WIB_"""
+_Next scan: tomorrow 8AM WIB_"""
 
 
 # ============================================================
@@ -306,7 +309,7 @@ Geopolitical/macro catalyst driving risk-on rotation.
   ❌ *Avoid:* {', '.join(sectors_out) if sectors_out else 'TBD'}
 
 ⏳ *No immediate trade ideas.*
-_Tomorrow's 7PM scan will reflect new regime._"""
+_Tomorrow's 8AM scan will reflect new regime._"""
 
 
 # ============================================================
@@ -336,7 +339,7 @@ def format_black_swan_info(event_summary: Dict[str, Any]) -> str:
 
 📊 *Status:* Informational only.
 Direction unclear or magnitude moderate.
-Tomorrow's 7PM scan will reassess.
+Tomorrow's 8AM scan will reassess.
 
 _System continues monitoring._"""
 
