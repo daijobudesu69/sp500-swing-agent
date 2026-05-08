@@ -4,8 +4,6 @@ on:
   schedule:
     # Primary: 01:00 UTC = 8:00 AM Jakarta
     - cron: '0 1 * * 2-6'
-    # Backup: 01:30 UTC = 8:30 AM Jakarta (safety net for cron jitter)
-    - cron: '30 1 * * 2-6'
   workflow_dispatch:  # manual trigger from Actions tab
 
 jobs:
