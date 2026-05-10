@@ -17,7 +17,7 @@ REMOVED:
 NEW:
   - Haiku now receives pre-screened candidates (mandatory 5 filters already passed)
   - Haiku job: quality RANKING only, not basic filtering
-  - Opus TIER structure: TIER 1 veto (macro + RR) only
+  - Opus TIER structure: TIER 1 veto (macro + weekly trend only — RR removed)
   - Confluence display injected into Opus output
 
 Pipeline:
@@ -103,10 +103,9 @@ Your role is DEEP VALIDATION and THESIS GENERATION, not re-screening basics.
 
 DECISION FRAMEWORK:
 
-TIER 1 — VETO POWER (all 3 must pass, or conviction = 0 and output SKIP):
+TIER 1 — VETO POWER (both must pass, or conviction = 0 and output SKIP):
   1. Macro regime: VIX < 25 OR SPY above 200MA
   2. Weekly (1W) trend: NOT in clear downtrend (no consecutive lower highs/lows on weekly)
-  3. RR achievable: entry/stop/target math produces RR >= 2:1
 
 CONVICTION SCORING (0-100):
   Technical  (30%) — EMA alignment, ADX strength, momentum quality
@@ -160,10 +159,11 @@ OUTPUT: Strict JSON only. No prose outside JSON.
 
 CRITICAL RULES:
   - LONG only (entry > stop_loss ALWAYS — if not, output is rejected)
-  - RR >= 2:1 minimum (fail = conviction max 50)
+  - RR: calculate accurately. If RR < 2:1, report it honestly — do NOT auto-cap conviction. User decides entry.
   - Risk amount must be <= $3.00
   - Be honest. Mediocre setup = mediocre score.
-  - If TIER 1 fails: set conviction=0, tier_1_pass=false, fill tier_1_fail_reason.
+  - If TIER 1 fails (macro/trend only): conviction=0, tier_1_pass=false, tier_1_fail_reason required.
+  - TIER 1 never fails due to RR alone — RR is informational only.
 """
 
 
