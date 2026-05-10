@@ -21,8 +21,9 @@ NEW:
   - Confluence display injected into Opus output
 
 Pipeline:
-  1. Haiku 4.5: quality score candidates that passed mandatory screener, keep top N
-  2. Opus 4: full thesis + entry/stop/TP/conviction for top 5
+  1. Mandatory screener (in indicators.py) → 5-10 candidates
+  2. Haiku 4.5 quality scoring → keep top N (default 5)
+  3. Opus 4.7 deep analysis → full thesis with entry/stop/TP/conviction
 """
 import json
 import logging
@@ -54,7 +55,8 @@ def get_client() -> Anthropic:
 FILTER_SYSTEM_PROMPT = """You are a senior quantitative analyst at a top hedge fund (Jane Street style).
 Your job: rate swing trade LONG candidates on a scale 0-100.
 
-IMPORTANT: All stocks sent to you have ALREADY passed mandatory technical filters:
+IMPORTANT: All stocks sent to you are from the S&P 500 universe and have ALREADY passed
+mandatory technical filters:
   - Price > EMA(50)
   - ADX(14) > 25 AND +DI > -DI (confirmed uptrend)
   - RSI(14) > 45 (not oversold)
@@ -63,7 +65,8 @@ IMPORTANT: All stocks sent to you have ALREADY passed mandatory technical filter
 
 Your job is NOT basic filtering. Your job is QUALITY RANKING within this pre-screened universe.
 
-Universe: S&P 500 stocks. Holding period: 1 day to 1 week max.
+Universe: S&P 500 stocks ONLY.
+Holding period: 1 day to 1 week max.
 Direction: LONG ONLY.
 
 RATING CRITERIA (focus on these):
@@ -92,7 +95,7 @@ Rules:
 DEEP_SYSTEM_PROMPT = """You are a senior Portfolio Manager at Jane Street, specializing in equity swing trading.
 Your job: produce a full trade thesis for a LONG-ONLY swing setup (max 1 week hold).
 
-CONTEXT: All stocks reaching you have passed:
+CONTEXT: All stocks reaching you are S&P 500 names that have passed:
   (a) Mandatory technical screener (EMA50, ADX+DI, RSI>45, Volume>1.3x, ATR>1.5%)
   (b) Haiku quality filter (score >= 65)
 
@@ -404,10 +407,15 @@ Pass through confluence_display exactly as shown above.
 # ============================================================
 
 def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
-    """Rough cost estimate (Anthropic May 2026 pricing)."""
+    """
+    Rough cost estimate per Anthropic pricing (verified May 2026).
+    Source: docs.claude.com/en/about-claude/pricing
+    """
     rates = {
-        "claude-haiku-4-5-20251001": (1.0, 5.0),
-        "claude-opus-4-20250514": (15.0, 75.0),
+        "claude-haiku-4-5-20251001": (1.0, 5.0),   # Haiku 4.5
+        "claude-opus-4-7": (5.0, 25.0),             # Opus 4.7
+        "claude-opus-4-6": (5.0, 25.0),             # Opus 4.6 (legacy)
+        "claude-sonnet-4-6": (3.0, 15.0),           # Sonnet 4.6
     }
-    in_rate, out_rate = rates.get(model, (15.0, 75.0))
+    in_rate, out_rate = rates.get(model, (5.0, 25.0))  # Default to Opus pricing
     return (input_tokens / 1_000_000 * in_rate) + (output_tokens / 1_000_000 * out_rate)
