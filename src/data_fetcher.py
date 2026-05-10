@@ -1,17 +1,50 @@
 """
-Data fetcher — gets price/indicator/macro/news data for analysis.
-All sources are FREE (yfinance, FRED, RSS).
+data_fetcher.py — Market data layer for SP500 Swing Agent.
+
+STAGE 2 REVISION (May 2026):
+============================
+REMOVED:
+  - fetch_multi_timeframe() — 4H/1H dropped entirely
+  - _resample_to_4h() — bug source, no longer needed
+  - SMC-specific data building
+
+ADDED:
+  - spy_1d_change_pct in fetch_market_context() — black swan detection
+  - fetch_weekly_trend() — EMA(8) based weekly trend assessment
+    Uses weekly EMA(8) to handle all possible weekly patterns robustly
+    Individual candle comparison is too fragile on weekly TF
+
+PRESERVED FROM PHASE 1:
+  - feedparser for RSS (cleaner than raw XML)
+  - FRED via direct requests (no fredapi dependency)
+  - t.history() for single ticker fetch
+  - detect_black_swan_keywords() scanning title + summary
+
+COLUMN CONTRACT:
+  All DataFrames returned have UPPERCASE columns: Open, High, Low, Close, Volume
+  Matches indicators.py expectations.
+
+WEEKLY TREND LOGIC (EMA-based, handles all weekly patterns):
+  Bullish:  price > EMA(8) AND EMA(8) rising   → confirmed uptrend
+  Bearish:  price < EMA(8) AND EMA(8) falling  → confirmed downtrend
+  Neutral:  mixed signals (e.g. big bounce but EMA still falling)
+  
+  TIER 1 only blocks "bearish". Neutral = allowed through.
+  
+  Handles edge cases:
+  - W1:-5%, W2:+3%, W3:+3% → EMA determines if recovery is confirmed
+  - W1:-2%, W2:-2%, W3:+5% → likely neutral (EMA still falling despite bounce)
 """
 import logging
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
-import numpy as np
-import yfinance as yf
 import feedparser
+import numpy as np
+import pandas as pd
 import requests
+import yfinance as yf
 
 from src import config
 
@@ -19,253 +52,381 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# PRICE DATA (yfinance)
+# CONSTANTS
 # ============================================================
 
-def fetch_ohlcv(ticker: str, period: str = "1y", interval: str = "1d") -> Optional[pd.DataFrame]:
+# Sector name (yfinance) → ETF ticker
+SECTOR_ETF_MAP = {
+    "Technology": "XLK",
+    "Financials": "XLF",
+    "Health Care": "XLV",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Communication Services": "XLC",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Utilities": "XLU",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+}
+
+# Default RSS feeds (overridden by config.RSS_FEEDS if set)
+DEFAULT_RSS_FEEDS = [
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC&region=US&lang=en-US",
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+]
+
+# Default black swan keywords (overridden by config.BLACK_SWAN_KEYWORDS if set)
+DEFAULT_BS_KEYWORDS = [
+    "crash", "circuit breaker", "market halt", "flash crash",
+    "federal reserve emergency", "emergency rate cut", "systemic risk",
+    "bank run", "contagion", "margin call", "black swan",
+    "recession fear", "yield curve crisis", "credit crisis",
+    "liquidity crisis", "market meltdown", "financial crisis",
+]
+
+HTTP_TIMEOUT = 10
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fetch OHLCV data for a single ticker.
-    period: '1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', 'ytd', 'max'
-    interval: '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '1d', '5d', '1wk', '1mo', '3mo'
+    Normalize DataFrame columns to uppercase (Open, High, Low, Close, Volume).
+    Handles lowercase (t.history) and MultiIndex (yf.download batch) edge cases.
+    """
+    if df is None or df.empty:
+        return df
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    col_map = {
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+        "adj close": "Close", "adj_close": "Close",
+    }
+    df.columns = [col_map.get(c.lower(), c) for c in df.columns]
+    return df
+
+
+def _safe_float(value, default=None):
+    try:
+        v = float(value)
+        return v if not (isinstance(v, float) and np.isnan(v)) else default
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# CORE OHLCV
+# ============================================================
+
+def fetch_ohlcv(
+    ticker: str,
+    period: str = "6mo",
+    interval: str = "1d",
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV for a single ticker via yfinance.
+    Returns DataFrame with uppercase columns, or None on failure.
+
+    Supported intervals: 1d, 1wk (primary for this system).
+    4H/1H removed — Stage 2 decision.
     """
     try:
         t = yf.Ticker(ticker)
         df = t.history(period=period, interval=interval, auto_adjust=True)
-        if df.empty:
-            logger.warning(f"No data for {ticker}")
+
+        if df is None or df.empty:
+            logger.debug(f"No data returned for {ticker}")
             return None
-        df.columns = [c.lower() for c in df.columns]
+
+        df = _normalize_columns(df)
+
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        if not required.issubset(df.columns):
+            logger.debug(f"Missing columns for {ticker}: {list(df.columns)}")
+            return None
+
+        df = df.dropna(subset=["Close", "Volume"])
+        if len(df) < 10:
+            logger.debug(f"Insufficient bars for {ticker}: {len(df)}")
+            return None
+
         return df
+
     except Exception as e:
-        logger.error(f"fetch_ohlcv failed for {ticker}: {e}")
+        logger.debug(f"fetch_ohlcv failed for {ticker}: {str(e)[:80]}")
         return None
-
-
-def fetch_multi_timeframe(ticker: str) -> Dict[str, pd.DataFrame]:
-    """
-    Fetch all timeframes for a ticker per config.
-    Returns dict: {'1wk': df, '1d': df, '4h': df, '1h': df}
-    Note: yfinance doesn't have '4h' — we resample from '1h' if needed.
-    """
-    out = {}
-
-    # 1-week
-    df_1w = fetch_ohlcv(ticker, period="2y", interval="1wk")
-    if df_1w is not None:
-        out["1wk"] = df_1w.tail(config.LOOKBACK_BARS_1W)
-
-    # Daily (primary TF)
-    df_1d = fetch_ohlcv(ticker, period="1y", interval="1d")
-    if df_1d is not None:
-        out["1d"] = df_1d.tail(config.LOOKBACK_BARS_1D)
-
-    # 1-hour
-    df_1h = fetch_ohlcv(ticker, period="60d", interval="1h")
-    if df_1h is not None:
-        out["1h"] = df_1h.tail(config.LOOKBACK_BARS_1H)
-        # Resample 1h → 4h for refinement TF
-        df_4h = _resample_to_4h(df_1h)
-        if df_4h is not None and len(df_4h) > 0:
-            out["4h"] = df_4h.tail(config.LOOKBACK_BARS_4H)
-
-    return out
-
-
-def _resample_to_4h(df_1h: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Resample 1h bars to 4h bars."""
-    try:
-        df_4h = df_1h.resample("4H").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna()
-        return df_4h
-    except Exception as e:
-        logger.error(f"4h resample failed: {e}")
-        return None
-
-
-def fetch_basic_info(ticker: str) -> Dict[str, Any]:
-    """
-    Fetch fundamental + meta info for a ticker.
-    Returns: market_cap, pe_ratio, sector, industry, beta, etc.
-    """
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        return {
-            "ticker": ticker,
-            "name": info.get("longName", ticker),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-            "market_cap": info.get("marketCap"),
-            "pe_ratio": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "peg_ratio": info.get("pegRatio"),
-            "beta": info.get("beta"),
-            "profit_margin": info.get("profitMargins"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth"),
-            "free_cashflow": info.get("freeCashflow"),
-            "next_earnings": info.get("earningsTimestamp"),
-            "avg_volume": info.get("averageVolume"),
-            "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
-        }
-    except Exception as e:
-        logger.error(f"fetch_basic_info failed for {ticker}: {e}")
-        return {"ticker": ticker, "error": str(e)}
 
 
 # ============================================================
-# MARKET-WIDE DATA (SPY, VIX, sectors)
+# MARKET CONTEXT
 # ============================================================
 
 def fetch_market_context() -> Dict[str, Any]:
     """
-    Fetch SPY, VIX, sector ETFs — used for regime detection.
+    Fetch real-time market context: VIX, SPY, DXY, sector performance.
+
+    Returns dict with:
+      vix, vix_spike_pct, vix_panic, vix_5d_avg
+      spy_price, spy_above_200ma, spy_5d_change_pct, spy_1d_change_pct (NEW)
+      spy_sma20, spy_sma50, spy_sma200
+      dxy, dxy_5d_change_pct
+      sector_5d_perf {sector_name: pct}
     """
-    out = {}
-
-    # SPY
-    spy = fetch_ohlcv("SPY", period="1y", interval="1d")
-    if spy is not None and len(spy) > 200:
-        spy_close = spy["close"]
-        out["spy_price"] = float(spy_close.iloc[-1])
-        out["spy_sma20"] = float(spy_close.rolling(20).mean().iloc[-1])
-        out["spy_sma50"] = float(spy_close.rolling(50).mean().iloc[-1])
-        out["spy_sma200"] = float(spy_close.rolling(200).mean().iloc[-1])
-        out["spy_above_200ma"] = out["spy_price"] > out["spy_sma200"]
-        out["spy_5d_change_pct"] = float(((spy_close.iloc[-1] / spy_close.iloc[-6]) - 1) * 100)
-        out["spy_20d_change_pct"] = float(((spy_close.iloc[-1] / spy_close.iloc[-21]) - 1) * 100)
-
-    # VIX
-    vix = fetch_ohlcv("^VIX", period="3mo", interval="1d")
-    if vix is not None and len(vix) > 5:
-        vix_close = vix["close"]
-        out["vix"] = float(vix_close.iloc[-1])
-        out["vix_5d_avg"] = float(vix_close.tail(5).mean())
-        out["vix_panic"] = out["vix"] > config.VIX_PANIC_THRESHOLD
-        # Spike check: today vs yesterday
-        if len(vix_close) >= 2:
-            spike_pct = ((vix_close.iloc[-1] / vix_close.iloc[-2]) - 1) * 100
-            out["vix_spike_pct"] = float(spike_pct)
-
-    # DXY (dollar index proxy)
-    dxy = fetch_ohlcv("DX-Y.NYB", period="3mo", interval="1d")
-    if dxy is not None and len(dxy) > 5:
-        out["dxy"] = float(dxy["close"].iloc[-1])
-        out["dxy_5d_change_pct"] = float(((dxy["close"].iloc[-1] / dxy["close"].iloc[-6]) - 1) * 100)
-
-    # Sector ETF performance (5-day)
-    sector_perf = {}
-    for sector_name, etf in config.SECTOR_ETFS_MAP.items():
-        df = fetch_ohlcv(etf, period="1mo", interval="1d")
-        if df is not None and len(df) >= 6:
-            change_5d = ((df["close"].iloc[-1] / df["close"].iloc[-6]) - 1) * 100
-            sector_perf[sector_name] = float(change_5d)
-    out["sector_5d_perf"] = sector_perf
-
-    return out
-
-
-# ============================================================
-# MACRO DATA (FRED)
-# ============================================================
-
-def fetch_fred_series(series_id: str, limit: int = 30) -> Optional[List[Dict]]:
-    """
-    Fetch a FRED time series. Common series:
-    - DGS10: 10-year Treasury yield
-    - DGS2: 2-year Treasury yield
-    - DFF: Federal Funds Rate
-    - UNRATE: Unemployment rate
-    - CPIAUCSL: CPI
-    """
-    if not config.FRED_API_KEY:
-        logger.warning("FRED_API_KEY not set, skipping macro fetch")
-        return None
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": series_id,
-        "api_key": config.FRED_API_KEY,
-        "file_type": "json",
-        "sort_order": "desc",
-        "limit": limit,
+    ctx = {
+        "vix": 20.0,
+        "vix_spike_pct": 0.0,
+        "vix_5d_avg": 20.0,
+        "vix_panic": False,
+        "spy_price": 0.0,
+        "spy_above_200ma": True,
+        "spy_5d_change_pct": 0.0,
+        "spy_1d_change_pct": 0.0,
+        "spy_sma20": 0.0,
+        "spy_sma50": 0.0,
+        "spy_sma200": 0.0,
+        "dxy": 100.0,
+        "dxy_5d_change_pct": 0.0,
+        "sector_5d_perf": {},
     }
+
+    # === SPY ===
     try:
-        r = requests.get(url, params=params, timeout=10)
+        spy_df = fetch_ohlcv("SPY", period="1y", interval="1d")
+        if spy_df is not None and len(spy_df) >= 10:
+            close = spy_df["Close"]
+            ctx["spy_price"] = round(float(close.iloc[-1]), 2)
+            ctx["spy_sma20"] = round(float(close.rolling(20).mean().iloc[-1]), 2)
+            ctx["spy_sma50"] = round(float(close.rolling(50).mean().iloc[-1]), 2)
+
+            if len(close) >= 200:
+                ctx["spy_sma200"] = round(float(close.rolling(200).mean().iloc[-1]), 2)
+                ctx["spy_above_200ma"] = ctx["spy_price"] > ctx["spy_sma200"]
+
+            if len(close) >= 6:
+                ctx["spy_5d_change_pct"] = round(
+                    ((float(close.iloc[-1]) / float(close.iloc[-6])) - 1) * 100, 2
+                )
+            if len(close) >= 2:
+                ctx["spy_1d_change_pct"] = round(
+                    ((float(close.iloc[-1]) / float(close.iloc[-2])) - 1) * 100, 2
+                )
+    except Exception as e:
+        logger.warning(f"SPY fetch failed: {e}")
+
+    # === VIX ===
+    try:
+        vix_df = fetch_ohlcv("^VIX", period="3mo", interval="1d")
+        if vix_df is not None and len(vix_df) >= 2:
+            vix_close = vix_df["Close"]
+            ctx["vix"] = round(float(vix_close.iloc[-1]), 2)
+            ctx["vix_5d_avg"] = round(float(vix_close.tail(5).mean()), 2)
+            ctx["vix_panic"] = ctx["vix"] > getattr(config, "VIX_PANIC_THRESHOLD", 25.0)
+            ctx["vix_spike_pct"] = round(
+                ((float(vix_close.iloc[-1]) / float(vix_close.iloc[-2])) - 1) * 100, 2
+            )
+    except Exception as e:
+        logger.warning(f"VIX fetch failed: {e}")
+
+    # === DXY ===
+    try:
+        dxy_df = fetch_ohlcv("DX-Y.NYB", period="1mo", interval="1d")
+        if dxy_df is not None and len(dxy_df) >= 6:
+            dxy_close = dxy_df["Close"]
+            ctx["dxy"] = round(float(dxy_close.iloc[-1]), 2)
+            ctx["dxy_5d_change_pct"] = round(
+                ((float(dxy_close.iloc[-1]) / float(dxy_close.iloc[-6])) - 1) * 100, 2
+            )
+    except Exception as e:
+        logger.debug(f"DXY fetch failed: {e}")
+
+    # === Sector ETF performance ===
+    sector_map = getattr(config, "SECTOR_ETFS_MAP", SECTOR_ETF_MAP)
+    perf = {}
+    for sector, etf in sector_map.items():
+        try:
+            df = fetch_ohlcv(etf, period="1mo", interval="1d")
+            if df is not None and len(df) >= 6:
+                c = df["Close"]
+                perf[sector] = round(
+                    ((float(c.iloc[-1]) / float(c.iloc[-6])) - 1) * 100, 2
+                )
+        except Exception:
+            pass
+    ctx["sector_5d_perf"] = perf
+
+    logger.info(
+        f"Market: VIX={ctx['vix']:.2f} (spike {ctx['vix_spike_pct']:+.1f}%), "
+        f"SPY={ctx['spy_price']:.2f} "
+        f"(1d {ctx['spy_1d_change_pct']:+.2f}%, 5d {ctx['spy_5d_change_pct']:+.2f}%), "
+        f"above 200MA={ctx['spy_above_200ma']}"
+    )
+    return ctx
+
+
+# ============================================================
+# FRED MACRO SNAPSHOT (direct requests, no fredapi)
+# ============================================================
+
+def fetch_fred_series(series_id: str, limit: int = 5) -> Optional[List[Dict]]:
+    """Fetch a FRED time series via direct API request."""
+    fred_key = getattr(config, "FRED_API_KEY", None)
+    if not fred_key:
+        return None
+    try:
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": series_id,
+            "api_key": fred_key,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": limit,
+        }
+        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         return r.json().get("observations", [])
     except Exception as e:
-        logger.error(f"FRED fetch failed for {series_id}: {e}")
+        logger.warning(f"FRED fetch failed ({series_id}): {str(e)[:60]}")
         return None
 
 
 def fetch_macro_snapshot() -> Dict[str, Any]:
     """
-    Get key macro indicators in one call.
+    Fetch key macro indicators from FRED.
+    Graceful fallback if FRED_API_KEY missing.
+
+    Returns dict with:
+      10y_yield, 2y_yield, fed_funds, yield_curve_spread, yield_curve_inverted
     """
-    out = {}
+    out = {
+        "10y_yield": "N/A",
+        "2y_yield": "N/A",
+        "fed_funds": "N/A",
+        "yield_curve_spread": "N/A",
+        "yield_curve_inverted": False,
+    }
+
+    fred_key = getattr(config, "FRED_API_KEY", None)
+    if not fred_key:
+        logger.debug("FRED_API_KEY not set — skipping macro snapshot")
+        return out
+
     series_map = {
         "10y_yield": "DGS10",
         "2y_yield": "DGS2",
         "fed_funds": "DFF",
-        "unemployment": "UNRATE",
-        "cpi": "CPIAUCSL",
     }
+
     for name, series_id in series_map.items():
         data = fetch_fred_series(series_id, limit=2)
-        if data and len(data) > 0:
+        if data:
             try:
-                latest_val = data[0].get("value")
-                if latest_val and latest_val != ".":
-                    out[name] = float(latest_val)
-                    out[f"{name}_date"] = data[0].get("date")
+                val = data[0].get("value")
+                if val and val != ".":
+                    out[name] = round(float(val), 3)
             except (ValueError, TypeError):
                 pass
-        time.sleep(0.2)  # be polite to FRED API
+        time.sleep(0.2)  # polite to FRED API
 
-    # Yield curve inversion check
-    if "10y_yield" in out and "2y_yield" in out:
-        out["yield_curve_spread"] = out["10y_yield"] - out["2y_yield"]
-        out["yield_curve_inverted"] = out["yield_curve_spread"] < 0
+    # Yield curve spread
+    if isinstance(out["10y_yield"], float) and isinstance(out["2y_yield"], float):
+        spread = out["10y_yield"] - out["2y_yield"]
+        out["yield_curve_spread"] = round(spread, 3)
+        out["yield_curve_inverted"] = spread < 0
 
     return out
 
 
 # ============================================================
-# NEWS (RSS + yfinance news)
+# FUNDAMENTALS
 # ============================================================
 
-def fetch_news_for_ticker(ticker: str, max_items: int = 10) -> List[Dict]:
+def fetch_basic_info(ticker: str) -> Dict[str, Any]:
     """
-    Get recent news for a specific ticker via yfinance.
+    Fetch fundamental data via yfinance.
+    Used in Opus deep analysis prompt.
     """
+    info = {
+        "ticker": ticker,
+        "name": ticker,
+        "sector": "Unknown",
+        "industry": "Unknown",
+        "market_cap": 0,
+        "forward_pe": "N/A",
+        "peg_ratio": "N/A",
+        "beta": "N/A",
+        "profit_margin": "N/A",
+        "revenue_growth": "N/A",
+        "earnings_growth": "N/A",
+        "next_earnings": None,
+    }
     try:
         t = yf.Ticker(ticker)
-        news_items = t.news[:max_items] if t.news else []
-        return [
-            {
+        raw = t.info or {}
+
+        info["name"] = raw.get("longName") or raw.get("shortName") or ticker
+        info["sector"] = raw.get("sector", "Unknown")
+        info["industry"] = raw.get("industry", "Unknown")
+        info["market_cap"] = raw.get("marketCap", 0) or 0
+        info["forward_pe"] = _safe_float(raw.get("forwardPE"), "N/A")
+        info["peg_ratio"] = _safe_float(raw.get("pegRatio"), "N/A")
+        info["beta"] = _safe_float(raw.get("beta"), "N/A")
+        info["profit_margin"] = _safe_float(raw.get("profitMargins"), "N/A")
+        info["revenue_growth"] = _safe_float(raw.get("revenueGrowth"), "N/A")
+        info["earnings_growth"] = _safe_float(raw.get("earningsGrowth"), "N/A")
+        info["next_earnings"] = raw.get("earningsTimestamp")
+
+    except Exception as e:
+        logger.debug(f"fetch_basic_info failed for {ticker}: {str(e)[:60]}")
+
+    return info
+
+
+# ============================================================
+# NEWS
+# ============================================================
+
+def fetch_news_for_ticker(
+    ticker: str,
+    max_items: int = 5,
+) -> List[Dict[str, str]]:
+    """
+    Fetch recent news headlines for a specific ticker via yfinance.
+    Returns list of {title, publisher, link, published_ts} dicts.
+    """
+    results = []
+    try:
+        t = yf.Ticker(ticker)
+        news = t.news or []
+        for item in news[:max_items]:
+            results.append({
                 "title": item.get("title", ""),
                 "publisher": item.get("publisher", ""),
                 "link": item.get("link", ""),
-                "published_ts": item.get("providerPublishTime", 0),
-            }
-            for item in news_items
-        ]
+                "published_ts": str(item.get("providerPublishTime", "")),
+            })
     except Exception as e:
-        logger.error(f"News fetch failed for {ticker}: {e}")
-        return []
+        logger.debug(f"Ticker news failed for {ticker}: {str(e)[:60]}")
+    return results
 
 
-def fetch_market_news_rss(max_items_per_feed: int = 15) -> List[Dict]:
+def fetch_market_news_rss(
+    max_items_per_feed: int = 15,
+) -> List[Dict[str, str]]:
     """
-    Aggregate market news from RSS feeds — used for black swan keyword detection.
+    Fetch general market news from RSS feeds using feedparser.
+    Used for black swan Type C keyword detection.
     """
     all_items = []
-    for feed_url in config.RSS_FEEDS:
+    feeds = getattr(config, "RSS_FEEDS", DEFAULT_RSS_FEEDS)
+
+    for feed_url in feeds:
         try:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:max_items_per_feed]:
@@ -277,68 +438,144 @@ def fetch_market_news_rss(max_items_per_feed: int = 15) -> List[Dict]:
                     "source": feed_url,
                 })
         except Exception as e:
-            logger.warning(f"RSS feed failed {feed_url}: {e}")
-            continue
+            logger.warning(f"RSS feed failed ({feed_url[:50]}): {str(e)[:60]}")
+
+    logger.info(f"RSS: {len(all_items)} items from {len(feeds)} feeds")
     return all_items
 
 
-def detect_black_swan_keywords(news_items: List[Dict]) -> List[Dict]:
+def detect_black_swan_keywords(
+    news_items: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
     """
-    Scan news headlines for black swan keywords.
-    Returns matched items with the trigger keyword.
+    Scan news title + summary for black swan keywords.
+    Returns matched items with trigger keywords listed.
     """
-    matches = []
-    keywords = [k.lower() for k in config.BLACK_SWAN_KEYWORDS]
+    keywords = [k.lower() for k in getattr(config, "BLACK_SWAN_KEYWORDS", DEFAULT_BS_KEYWORDS)]
+    matched = []
+
     for item in news_items:
         title_lower = item.get("title", "").lower()
         summary_lower = item.get("summary", "").lower()
         combined = title_lower + " " + summary_lower
         matched_kws = [k for k in keywords if k in combined]
         if matched_kws:
-            matches.append({**item, "matched_keywords": matched_kws})
-    return matches
+            matched.append({**item, "matched_keywords": matched_kws})
+
+    if matched:
+        logger.info(
+            f"Black swan keywords matched {len(matched)} headlines: "
+            f"{[m['title'][:50] for m in matched[:3]]}"
+        )
+    return matched
 
 
 # ============================================================
-# COMBINED SNAPSHOT (used by analyzer)
+# WEEKLY TREND (EMA-based)
 # ============================================================
 
-def build_full_snapshot(ticker: str) -> Dict[str, Any]:
+def fetch_weekly_trend(ticker: str) -> str:
     """
-    One-shot fetch of everything needed for deep LLM analysis on a ticker.
-    """
-    snapshot = {
-        "ticker": ticker,
-        "fetched_at": datetime.utcnow().isoformat(),
-    }
-    snapshot["price_data"] = fetch_multi_timeframe(ticker)
-    snapshot["fundamentals"] = fetch_basic_info(ticker)
-    snapshot["news"] = fetch_news_for_ticker(ticker, max_items=5)
-    return snapshot
+    Assess weekly trend using EMA(8) on weekly closes.
+    More robust than comparing individual weekly bars.
 
+    4-state EMA logic:
+      price > EMA AND EMA rising  → "bullish"  (confirmed uptrend)
+      price < EMA AND EMA falling → "bearish"  (confirmed downtrend)
+      price > EMA AND EMA falling → "neutral"  (bounce, EMA not confirmed yet)
+      price < EMA AND EMA rising  → "neutral"  (EMA turning, price lagging)
+
+    Examples:
+      W1:-5%, W2:+3%, W3:+3% → depends on EMA position
+        If price recovered above EMA and EMA started rising → "bullish"
+        If EMA still falling despite bounce → "neutral"
+
+      W1:-2%, W2:-2%, W3:+5% → likely "neutral"
+        EMA would still be falling after 2 down weeks
+        Big W3 bounce puts price near/above EMA but EMA not yet rising
+        Correct: "neutral" (not bearish = TIER 1 passes)
+
+    TIER 1 only blocks "bearish". Neutral passes through.
+
+    Returns: "bullish", "bearish", or "neutral"
+    """
+    try:
+        df = fetch_ohlcv(ticker, period="6mo", interval="1wk")
+
+        if df is None or len(df) < 10:
+            logger.debug(f"Insufficient weekly bars for {ticker}")
+            return "neutral"
+
+        closes = df["Close"].dropna()
+        if len(closes) < 10:
+            return "neutral"
+
+        # Weekly EMA(8) — standard for weekly timeframe analysis
+        ema8 = closes.ewm(span=8, adjust=False).mean()
+
+        current_close = float(closes.iloc[-1])
+        current_ema = float(ema8.iloc[-1])
+        prev_ema = float(ema8.iloc[-2])
+
+        price_above_ema = current_close > current_ema
+        ema_rising = current_ema > prev_ema
+
+        if price_above_ema and ema_rising:
+            trend = "bullish"
+        elif not price_above_ema and not ema_rising:
+            trend = "bearish"
+        else:
+            trend = "neutral"
+
+        logger.debug(
+            f"Weekly trend {ticker}: {trend} "
+            f"(close={current_close:.2f}, EMA8={current_ema:.2f}, "
+            f"EMA rising={ema_rising})"
+        )
+        return trend
+
+    except Exception as e:
+        logger.debug(f"fetch_weekly_trend failed for {ticker}: {str(e)[:60]}")
+        return "neutral"
+
+
+# ============================================================
+# SMOKE TEST
+# ============================================================
 
 if __name__ == "__main__":
-    # Quick local test
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    print("\n=== OHLCV Test ===")
+    df = fetch_ohlcv("NVDA", period="6mo", interval="1d")
+    if df is not None:
+        print(f"NVDA daily: {len(df)} bars | close ${df['Close'].iloc[-1]:.2f}")
+        print(f"Columns: {list(df.columns)}")
 
     print("\n=== Market Context ===")
     ctx = fetch_market_context()
     for k, v in ctx.items():
         if k != "sector_5d_perf":
             print(f"  {k}: {v}")
-    print(f"\n  Sector 5d performance:")
-    for s, p in sorted(ctx.get("sector_5d_perf", {}).items(), key=lambda x: -x[1]):
+    print("  Top sectors by 5d perf:")
+    for s, p in sorted(ctx["sector_5d_perf"].items(), key=lambda x: -x[1])[:3]:
         print(f"    {s}: {p:+.2f}%")
 
     print("\n=== Macro Snapshot ===")
-    macro = fetch_macro_snapshot()
-    for k, v in macro.items():
+    snap = fetch_macro_snapshot()
+    print(snap)
+
+    print("\n=== Fundamentals ===")
+    info = fetch_basic_info("NVDA")
+    for k, v in info.items():
         print(f"  {k}: {v}")
 
-    print("\n=== Black Swan News Scan ===")
-    news = fetch_market_news_rss()
+    print("\n=== Weekly Trend ===")
+    for t in ["NVDA", "AMD", "SPY"]:
+        trend = fetch_weekly_trend(t)
+        print(f"  {t}: {trend}")
+
+    print("\n=== RSS + Black Swan ===")
+    news = fetch_market_news_rss(max_items_per_feed=5)
     matches = detect_black_swan_keywords(news)
-    print(f"  Total news items: {len(news)}")
-    print(f"  Black swan matches: {len(matches)}")
-    for m in matches[:3]:
-        print(f"    - {m['title'][:80]}... [{', '.join(m['matched_keywords'])}]")
+    print(f"  RSS items: {len(news)} | BS matches: {len(matches)}")
