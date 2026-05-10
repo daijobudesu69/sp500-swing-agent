@@ -105,7 +105,11 @@ DECISION FRAMEWORK:
 
 TIER 1 — VETO POWER (both must pass, or conviction = 0 and output SKIP):
   1. Macro regime: VIX < 25 OR SPY above 200MA
-  2. Weekly (1W) trend: NOT in clear downtrend (no consecutive lower highs/lows on weekly)
+  2. Weekly (1W) trend: must be "bullish" or "neutral" — fails ONLY if "bearish"
+     - "bearish"  = TIER 1 fails → veto
+     - "neutral"  = TIER 1 passes → continue
+     - "bullish"  = TIER 1 passes → continue
+     The weekly_trend value is provided in the user prompt.
 
 CONVICTION SCORING (0-100):
   Technical  (30%) — EMA alignment, ADX strength, momentum quality
@@ -340,41 +344,39 @@ def _build_deep_analysis_prompt(ticker: str, data: Dict[str, Any]) -> str:
 COMPANY: {fund.get('name', ticker)}
 SECTOR: {fund.get('sector', 'Unknown')} / {fund.get('industry', 'Unknown')}
 
-=== MANDATORY FILTERS STATUS (all pre-verified as PASS) ===
-Price > EMA(50): PASS
-ADX > 25 + (+DI > -DI): PASS
-RSI > 45: PASS
-Volume ratio > 1.3x: PASS
-ATR > 1.5%: PASS
-
-=== PRICE & TREND ===
 Current price: ${ind.get('price', 0):.2f}
-EMA(9):  ${ind.get('ema_9', 0):.2f} | EMA(21): ${ind.get('ema_21', 0):.2f} | EMA(50): ${ind.get('ema_50', 0):.2f}
-Above EMA(9):  {ind.get('above_ema_9', False)}
-Above EMA(21): {ind.get('above_ema_21', False)}
-Above EMA(50): True (mandatory filter)
 
-=== MOMENTUM ===
-RSI(14): {ind.get('rsi_14', 0):.1f}
-MACD histogram: {ind.get('macd_histogram', 0):.4f} (positive: {ind.get('macd_positive', False)})
+=== 🔒 MANDATORY FILTERS (all pre-verified as PASS — these gated the signal) ===
 
-=== TREND STRENGTH ===
-ADX(14): {ind.get('adx_14', 0):.1f}
-+DI: {ind.get('plus_di', 0):.1f} | -DI: {ind.get('minus_di', 0):.1f}
+  1. Price > EMA(50): PASS
+     Price ${ind.get('price', 0):.2f} > EMA50 ${ind.get('ema_50', 0):.2f}
 
-=== VOLATILITY ===
-ATR(14): ${ind.get('atr_14', 0):.2f} ({ind.get('atr_pct', 0):.2f}% of price)
+  2. ADX(14) > 25 AND +DI > -DI: PASS
+     ADX={ind.get('adx_14', 0):.1f} | +DI={ind.get('plus_di', 0):.1f} | -DI={ind.get('minus_di', 0):.1f}
 
-=== VOLUME ===
-Today: {ind.get('vol_today', 0):,}
-14d avg: {ind.get('vol_avg_14d', 0):,}
-Ratio: {ind.get('vol_ratio_14d', 0):.2f}x
+  3. RSI(14) > 45: PASS
+     RSI={ind.get('rsi_14', 0):.1f}
 
-=== CONFLUENCE (informational) ===
-{confluence_display}
+  4. Volume ratio (14d) > 1.3x: PASS
+     Today: {ind.get('vol_today', 0):,} | 14d avg: {ind.get('vol_avg_14d', 0):,} | Ratio: {ind.get('vol_ratio_14d', 0):.2f}x
 
-=== WEEKLY TREND (1W) ===
+  5. ATR(14) > 1.5% of price: PASS
+     ATR=${ind.get('atr_14', 0):.2f} ({ind.get('atr_pct', 0):.2f}% of price)
+
+=== ➕ OPTIONAL CONFLUENCE (informational — boosts conviction, does NOT gate) ===
+
+  - MACD histogram > 0: {ind.get('macd_positive', False)}
+    Value: {ind.get('macd_histogram', 0):.4f}
+  - Price > EMA(21): {ind.get('above_ema_21', False)}
+    EMA21 = ${ind.get('ema_21', 0):.2f}
+  - Price > EMA(9): {ind.get('above_ema_9', False)}
+    EMA9 = ${ind.get('ema_9', 0):.2f}
+
+Confluence score: {confluence_display}
+
+=== 📅 WEEKLY TREND (TIER 1 input) ===
 1W trend: {data.get('weekly_trend', 'unknown')}
+TIER 1 rule: passes if "bullish" or "neutral"; fails ONLY if "bearish"
 
 === FUNDAMENTALS ===
 Market cap: ${fund.get('market_cap', 0):,.0f}
