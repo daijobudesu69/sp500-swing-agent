@@ -315,6 +315,12 @@ def build_brief_data(df: pd.DataFrame, ticker: str = "",
     """
     Build a flat dict for Haiku filter input (no SMC fields).
     Returns None if data insufficient or partial-bar detected.
+
+    Output structure organized by:
+      - MANDATORY filters (5): EMA50, ADX+DI, RSI, Volume, ATR
+        These ALL must pass for the signal to exist.
+      - OPTIONAL confluence (3): EMA9, EMA21, MACD histogram
+        These are informational — boost conviction but don't gate.
     """
     result = compute_indicators(df)
     if "error" in result:
@@ -328,29 +334,36 @@ def build_brief_data(df: pd.DataFrame, ticker: str = "",
         "ticker": ticker,
         "sector": sector,
         "price": result["price"],
-        # Trend
-        "ema_9": ind["ema_9"],
-        "ema_21": ind["ema_21"],
+
+        # ===== MANDATORY FILTERS (must pass — gates signal) =====
+        # 1. Trend anchor: Price > EMA(50)
         "ema_50": ind["ema_50"],
         "above_ema_50": scr["pass_ema_50"],
-        "above_ema_21": conf["above_ema_21"],
-        "above_ema_9": conf["above_ema_9"],
-        # Momentum
-        "rsi_14": ind["rsi_14"],
-        "macd_histogram": ind["macd_histogram"],
-        "macd_positive": conf["macd_positive"],
-        # Strength
+        # 2. Trend strength: ADX(14) > 25 AND +DI > -DI
         "adx_14": ind["adx_14"],
         "plus_di": ind["plus_di"],
         "minus_di": ind["minus_di"],
         "adx_bullish": scr["pass_adx_di"],
-        # Volatility
+        # 3. Momentum floor: RSI(14) > 45
+        "rsi_14": ind["rsi_14"],
+        # 4. Volume confirmation: ratio > 1.3x
+        "vol_ratio_14d": ind["vol_ratio_14d"],
+        "vol_today": ind["vol_today"],
+        "vol_avg_14d": ind["vol_avg_14d"],
+        "vol_surge": scr["pass_volume"],
+        # 5. Volatility floor: ATR > 1.5% of price
         "atr_14": ind["atr_14"],
         "atr_pct": ind["atr_pct"],
-        # Volume
-        "vol_ratio_14d": ind["vol_ratio_14d"],
-        "vol_surge": scr["pass_volume"],
-        # Aggregate
+
+        # ===== OPTIONAL CONFLUENCE (informational — boosts conviction, not gating) =====
+        "ema_9": ind["ema_9"],
+        "ema_21": ind["ema_21"],
+        "above_ema_21": conf["above_ema_21"],
+        "above_ema_9": conf["above_ema_9"],
+        "macd_histogram": ind["macd_histogram"],
+        "macd_positive": conf["macd_positive"],
+
+        # ===== AGGREGATE STATUS =====
         "all_mandatory_pass": scr["all_pass"],
         "confluence_count": conf["count"],
         "confluence_display": conf["display"],
