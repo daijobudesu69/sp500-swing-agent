@@ -1,11 +1,28 @@
 """
-LLM-based analyst — uses Claude to score setups and produce trade thesis.
+analyst.py — LLM-based analyst using Claude to score setups and produce trade thesis.
+
+STAGE 2 REVISION (May 2026):
+============================
+BUGS FIXED:
+  - Removed `temperature` parameter (caused 400 errors on all Opus calls)
+  - Fixed cache_control: None issue (key now omitted when caching disabled)
+  - Promotion threshold lowered: 75 → 65 (was starving Opus of candidates)
+  - Top N promoted to Opus: 3 → 5
+
+REMOVED:
+  - All SMC references from Haiku + Opus prompts and input data
+  - 4H / HTF alignment references
+  - TIER 2 SMC criteria from Opus system prompt
+
+NEW:
+  - Haiku now receives pre-screened candidates (mandatory 5 filters already passed)
+  - Haiku job: quality RANKING only, not basic filtering
+  - Opus TIER structure: TIER 1 veto (macro + RR) only
+  - Confluence display injected into Opus output
 
 Pipeline:
-  1. Haiku 4.5 quick filter: rate 50 candidates 0-100, keep top 15
-  2. Opus 4.7 deep analysis: full thesis + entry/stop/TP/conviction for top 5
-
-Cost-optimized: prompt caching enabled, output token caps tight.
+  1. Haiku 4.5: quality score candidates that passed mandatory screener, keep top N
+  2. Opus 4: full thesis + entry/stop/TP/conviction for top 5
 """
 import json
 import logging
@@ -17,12 +34,11 @@ from src import config
 
 logger = logging.getLogger(__name__)
 
-# Initialize once
 _client: Optional[Anthropic] = None
 
 
 def get_client() -> Anthropic:
-    """Lazy-init Anthropic client (avoids errors if key missing during import)."""
+    """Lazy-init Anthropic client."""
     global _client
     if _client is None:
         if not config.ANTHROPIC_API_KEY:
@@ -32,72 +48,89 @@ def get_client() -> Anthropic:
 
 
 # ============================================================
-# SYSTEM PROMPTS (cacheable for cost savings)
+# SYSTEM PROMPTS
 # ============================================================
 
 FILTER_SYSTEM_PROMPT = """You are a senior quantitative analyst at a top hedge fund (Jane Street style).
 Your job: rate swing trade LONG candidates on a scale 0-100.
 
+IMPORTANT: All stocks sent to you have ALREADY passed mandatory technical filters:
+  - Price > EMA(50)
+  - ADX(14) > 25 AND +DI > -DI (confirmed uptrend)
+  - RSI(14) > 45 (not oversold)
+  - Volume ratio (14d avg) > 1.3x (above-average activity)
+  - ATR(14) > 1.5% of price (sufficient volatility for 2:1 RR)
+
+Your job is NOT basic filtering. Your job is QUALITY RANKING within this pre-screened universe.
+
 Universe: S&P 500 stocks. Holding period: 1 day to 1 week max.
-Direction bias: LONG ONLY (no shorts, no inverse ETFs).
+Direction: LONG ONLY.
 
-RATING CRITERIA:
-- Technical setup quality (SMC patterns, RSI, MACD, volume)
-- Trend alignment across timeframes
-- Risk/reward potential at current levels
-- Macro regime fit
+RATING CRITERIA (focus on these):
+  1. Trend quality — how clean and strong is the uptrend? (EMA alignment, ADX strength)
+  2. Entry timing — is price at a good risk/reward entry point or already extended?
+  3. Momentum conviction — MACD histogram, volume surge quality
+  4. Macro regime fit — does the sector/stock benefit from current macro?
+  5. Fundamental quality — is the business backing the technical move?
 
-OUTPUT FORMAT: JSON only. No prose, no explanation.
-{"score": <0-100>, "reason": "<10 words max>"}
+SCORING GUIDE:
+  80-100 = Exceptional setup. Strong trend, clean entry, volume confirmed, macro aligned.
+  65-79  = Good setup. Most criteria met, minor concerns.
+  50-64  = Watchlist only. Passes filters but lacks conviction.
+  < 50   = Weak. Skip even though it passed mandatory filters.
+
+OUTPUT FORMAT: JSON only. No prose, no explanation outside JSON.
+{"score": <0-100>, "reason": "<15 words max>"}
 
 Rules:
-- Score >= 75 = strong setup, deserves deep analysis
-- Score 60-74 = decent setup, watch
-- Score < 60 = skip
-- Be CRITICAL. Only ~30% of candidates should score >= 70.
+  - Be CRITICAL. Only ~30% of candidates should score >= 65.
+  - Penalize stocks that are extended (RSI near 80, far above EMAs).
+  - Reward stocks showing fresh momentum (MACD turning positive, volume surging today).
+  - Consider if the setup is early enough for a 7-day hold to generate 2:1 RR.
 """
 
 DEEP_SYSTEM_PROMPT = """You are a senior Portfolio Manager at Jane Street, specializing in equity swing trading.
 Your job: produce a full trade thesis for a LONG-ONLY swing setup (max 1 week hold).
 
-DECISION FRAMEWORK (use this hierarchy when indicators conflict):
-TIER 1 (VETO POWER - all must pass):
-  - Macro regime: VIX < 25 OR SPY > 200MA
-  - HTF (1W) not in clear downtrend
-  - Achievable RR >= 2:1
+CONTEXT: All stocks reaching you have passed:
+  (a) Mandatory technical screener (EMA50, ADX+DI, RSI>45, Volume>1.3x, ATR>1.5%)
+  (b) Haiku quality filter (score >= 65)
 
-TIER 2 (PRIMARY - need 2 of 3):
-  - SMC setup (Order Block / FVG / BOS active)
-  - Volume confirmation (>1.5x avg or rising on test)
-  - Multi-TF alignment (1D up + 4H not extreme)
+Your role is DEEP VALIDATION and THESIS GENERATION, not re-screening basics.
 
-TIER 3 (SECONDARY - bonus only):
-  - RSI in 40-65 zone
-  - MACD bullish (histogram positive or recent cross)
-  - Sector outperforming SPY
+DECISION FRAMEWORK:
 
-CONFLICT RESOLUTION:
-- SMC > Volume > Macro > RSI > MACD (price action leads, lagging indicators follow)
-- If TIER 1 fails: conviction = 0, SKIP
-- If TIER 2 < 2 confirmations: max conviction = 64 (watchlist only)
+TIER 1 — VETO POWER (all 3 must pass, or conviction = 0 and output SKIP):
+  1. Macro regime: VIX < 25 OR SPY above 200MA
+  2. Weekly (1W) trend: NOT in clear downtrend (no consecutive lower highs/lows on weekly)
+  3. RR achievable: entry/stop/target math produces RR >= 2:1
 
 CONVICTION SCORING (0-100):
-  Technical (30%) + Fundamental (25%) + Macro (20%) + News (15%) + RR (10%)
+  Technical  (30%) — EMA alignment, ADX strength, momentum quality
+  Fundamental (25%) — earnings growth, margin, valuation reasonableness
+  Macro      (20%) — sector tailwind, VIX, SPY trend, rate environment
+  News       (15%) — catalyst presence, earnings proximity risk
+  RR         (10%) — actual entry/stop/TP math quality
 
 CONVICTION TIERS:
-  80-100 = HIGH (max 2x leverage acceptable)
-  65-79 = STANDARD (1x only)
-  50-64 = WATCHLIST (do not enter)
-  < 50 = SKIP
+  80-100 = HIGH conviction
+  65-79  = STANDARD conviction
+  50-64  = WATCHLIST (do not enter — flag only)
+  < 50   = SKIP
 
 POSITION SIZING:
   Account: $100. Max risk per trade: 3% ($3).
-  Position size = Risk / (Entry - Stop) * Entry
+  Position size = Risk / (Entry - Stop)
+  Stop = Entry - (1.5 x ATR)
+  TP1  = Entry + (2.0 x (Entry - Stop))
+  TP2  = Entry + (3.0 x (Entry - Stop))
 
 OUTPUT: Strict JSON only. No prose outside JSON.
 {
   "ticker": "<symbol>",
   "conviction": <0-100>,
+  "tier_1_pass": <bool>,
+  "tier_1_fail_reason": "<null or reason why TIER 1 failed>",
   "breakdown": {
     "technical": <0-30>,
     "fundamental": <0-25>,
@@ -105,13 +138,8 @@ OUTPUT: Strict JSON only. No prose outside JSON.
     "news_catalyst": <0-15>,
     "rr_asymmetry": <0-10>
   },
-  "tier_assessment": {
-    "tier_1_pass": <bool>,
-    "tier_2_confirmations": <int 0-3>,
-    "tier_3_bonus": <int 0-3>
-  },
   "direction": "LONG",
-  "setup_type": "<short label like 'SMC OB bounce + BOS continuation'>",
+  "setup_type": "<short label, e.g. 'Trend continuation + volume surge'>",
   "entry": <float>,
   "stop_loss": <float>,
   "tp1": <float>,
@@ -121,18 +149,37 @@ OUTPUT: Strict JSON only. No prose outside JSON.
   "position_size_usd": <float>,
   "shares": <float>,
   "risk_amount_usd": <float>,
-  "max_leverage": "<1x or 2x>",
-  "thesis": "<3-4 sentence explanation>",
+  "thesis": "<3-4 sentences. Why this stock, why now, what confirms the move>",
   "invalidation": ["<condition 1>", "<condition 2>", "<condition 3>"],
-  "max_holding_days": <int 1-7>
+  "max_holding_days": <int 1-7>,
+  "confluence_display": "<pass through from input data, e.g. '2/3 (MACD✓ EMA9✗ EMA21✓)'>"
 }
 
 CRITICAL RULES:
-- LONG only (entry > stop_loss always)
-- RR >= 2:1 minimum (fail this = conviction max 50)
-- Risk amount must be <= $3.00
-- Be honest. If setup is mediocre, score it mediocre.
+  - LONG only (entry > stop_loss ALWAYS — if not, output is rejected)
+  - RR >= 2:1 minimum (fail = conviction max 50)
+  - Risk amount must be <= $3.00
+  - Be honest. Mediocre setup = mediocre score.
+  - If TIER 1 fails: set conviction=0, tier_1_pass=false, fill tier_1_fail_reason.
 """
+
+
+# ============================================================
+# HELPERS — cache_control safe builder
+# ============================================================
+
+def _build_system(prompt_text: str, use_cache: bool) -> Any:
+    """
+    Build the system prompt arg correctly.
+    Avoids passing cache_control=None which can cause API issues.
+    """
+    if use_cache:
+        return [{
+            "type": "text",
+            "text": prompt_text,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    return prompt_text  # Plain string when caching disabled
 
 
 # ============================================================
@@ -141,43 +188,54 @@ CRITICAL RULES:
 
 def haiku_filter_candidate(ticker: str, brief_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Quick LLM filter for a single candidate.
-    Input: small data summary. Output: {score, reason}.
-    Cost: ~$0.002 per call.
+    Quick LLM quality score for a single pre-screened candidate.
+    Input: brief_data from indicators.build_brief_data().
+    Output: {score, reason, tokens_used}.
     """
     client = get_client()
 
     user_prompt = f"""Stock: {ticker}
 Sector: {brief_data.get('sector', 'Unknown')}
 Price: ${brief_data.get('price', 0):.2f}
-RSI(14): {brief_data.get('rsi', 0):.1f} ({brief_data.get('rsi_zone', '?')})
-MACD histogram: {brief_data.get('macd_histogram', 0):.3f} (rising: {brief_data.get('macd_histogram_rising', False)})
-MACD bullish cross last 5d: {brief_data.get('macd_bullish_cross_5d', False)}
-Above 20MA: {brief_data.get('above_sma_20', False)} | 50MA: {brief_data.get('above_sma_50', False)} | 200MA: {brief_data.get('above_sma_200', False)}
-Volume ratio (vs 20d avg): {brief_data.get('volume_ratio', 0):.2f}x
-SMC Order Blocks active: {brief_data.get('num_order_blocks', 0)}
-SMC Unfilled FVGs: {brief_data.get('num_fvgs', 0)}
-SMC Structure: BOS_bullish={brief_data.get('bos_bullish', False)}, CHoCH_bearish={brief_data.get('choch_bearish', False)}
-SMC Zone: {brief_data.get('zone', 'unknown')}
-HTF aligned bullish: {brief_data.get('htf_aligned_bullish', False)}
-Macro regime: {brief_data.get('macro_regime', 'unknown')}
 
-Rate this LONG swing setup 0-100. JSON only."""
+=== TREND ===
+Above EMA(50): {brief_data.get('above_ema_50', False)}
+Above EMA(21): {brief_data.get('above_ema_21', False)}
+Above EMA(9):  {brief_data.get('above_ema_9', False)}
+EMA(50): ${brief_data.get('ema_50', 0):.2f} | EMA(21): ${brief_data.get('ema_21', 0):.2f} | EMA(9): ${brief_data.get('ema_9', 0):.2f}
+
+=== MOMENTUM ===
+RSI(14): {brief_data.get('rsi_14', 0):.1f}
+MACD histogram: {brief_data.get('macd_histogram', 0):.4f} (positive: {brief_data.get('macd_positive', False)})
+
+=== TREND STRENGTH ===
+ADX(14): {brief_data.get('adx_14', 0):.1f}
++DI: {brief_data.get('plus_di', 0):.1f} | -DI: {brief_data.get('minus_di', 0):.1f}
+ADX bullish (+DI > -DI): {brief_data.get('adx_bullish', False)}
+
+=== VOLATILITY ===
+ATR(14): ${brief_data.get('atr_14', 0):.2f} ({brief_data.get('atr_pct', 0):.2f}% of price)
+
+=== VOLUME ===
+Volume ratio vs 14d avg: {brief_data.get('vol_ratio_14d', 0):.2f}x (surge: {brief_data.get('vol_surge', False)})
+
+=== CONFLUENCE ===
+{brief_data.get('confluence_display', 'N/A')}
+
+=== MACRO ===
+Regime: {brief_data.get('macro_regime', 'unknown')}
+
+Note: This stock ALREADY passed all 5 mandatory filters.
+Rate the QUALITY of this swing setup 0-100. JSON only."""
 
     try:
         response = client.messages.create(
             model=config.LLM_MODEL_FILTER,
             max_tokens=config.LLM_MAX_TOKENS_FILTER,
-            temperature=config.LLM_TEMPERATURE,
-            system=[{
-                "type": "text",
-                "text": FILTER_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"} if config.LLM_USE_PROMPT_CACHING else None,
-            }] if config.LLM_USE_PROMPT_CACHING else FILTER_SYSTEM_PROMPT,
+            system=_build_system(FILTER_SYSTEM_PROMPT, config.LLM_USE_PROMPT_CACHING),
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw_text = response.content[0].text.strip()
-        # Strip code fences if present
         if raw_text.startswith("```"):
             raw_text = raw_text.split("```")[1]
             if raw_text.startswith("json"):
@@ -191,17 +249,22 @@ Rate this LONG swing setup 0-100. JSON only."""
             "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
         }
     except json.JSONDecodeError as e:
-        logger.error(f"Haiku JSON parse failed for {ticker}: {e} | raw: {raw_text[:200]}")
+        logger.error(f"Haiku JSON parse failed for {ticker}: {e}")
         return {"ticker": ticker, "score": 0, "reason": "parse_error"}
     except Exception as e:
         logger.error(f"Haiku filter failed for {ticker}: {e}")
         return {"ticker": ticker, "score": 0, "reason": f"error: {str(e)[:50]}"}
 
 
-def filter_candidates_haiku(candidates: List[Dict[str, Any]], top_n: int = 15) -> List[Dict[str, Any]]:
+def filter_candidates_haiku(candidates: List[Dict[str, Any]],
+                            top_n: int = None) -> List[Dict[str, Any]]:
     """
-    Run Haiku filter on a list of candidates, return top N by score.
+    Run Haiku quality scoring on pre-screened candidates, return top N by score.
+    top_n defaults to config.LLM_HAIKU_TOP_N (5).
     """
+    if top_n is None:
+        top_n = getattr(config, "LLM_HAIKU_TOP_N", 5)
+
     scored = []
     for cand in candidates:
         ticker = cand.get("ticker")
@@ -211,7 +274,11 @@ def filter_candidates_haiku(candidates: List[Dict[str, Any]], top_n: int = 15) -
         logger.info(f"Haiku scored {ticker}: {result['score']} ({result['reason']})")
 
     scored.sort(key=lambda x: -x.get("score", 0))
-    return scored[:top_n]
+    top = scored[:top_n]
+    logger.info(
+        f"Haiku top {top_n}: {[(c['ticker'], c['score']) for c in top]}"
+    )
+    return top
 
 
 # ============================================================
@@ -221,23 +288,17 @@ def filter_candidates_haiku(candidates: List[Dict[str, Any]], top_n: int = 15) -
 def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Full thesis generation for a strong candidate.
-    Input: comprehensive data. Output: full trade signal JSON.
-    Cost: ~$0.05 per call.
+    Input: comprehensive data from data_fetcher + indicators.
+    Output: full trade signal JSON.
     """
     client = get_client()
-
     user_prompt = _build_deep_analysis_prompt(ticker, full_data)
 
     try:
         response = client.messages.create(
             model=config.LLM_MODEL_DEEP,
             max_tokens=config.LLM_MAX_TOKENS_DEEP,
-            temperature=config.LLM_TEMPERATURE,
-            system=[{
-                "type": "text",
-                "text": DEEP_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"} if config.LLM_USE_PROMPT_CACHING else None,
-            }] if config.LLM_USE_PROMPT_CACHING else DEEP_SYSTEM_PROMPT,
+            system=_build_system(DEEP_SYSTEM_PROMPT, config.LLM_USE_PROMPT_CACHING),
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw_text = response.content[0].text.strip()
@@ -262,28 +323,10 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
 def _build_deep_analysis_prompt(ticker: str, data: Dict[str, Any]) -> str:
     """Construct the user prompt for Opus deep analysis."""
     fund = data.get("fundamentals", {})
-    tech = data.get("technical", {}).get("traditional", {})
-    smc = data.get("technical", {}).get("smc", {})
-    mtf = data.get("technical", {}).get("mtf_alignment", {})
+    ind = data.get("indicators", {})
     macro = data.get("macro_context", {})
     news = data.get("news", [])
-
-    # Format SMC findings
-    obs = smc.get("order_blocks", [])
-    fvgs = smc.get("fair_value_gaps", [])
-    structure = smc.get("structure", {})
-    liq_sweep = smc.get("liquidity_sweep", {})
-    zone = smc.get("zone", {})
-
-    ob_summary = "\n".join([
-        f"  - OB at ${ob['low']:.2f}-${ob['high']:.2f} (mid ${ob['mid']:.2f}), {ob['bars_since_formed']} bars old, impulse {ob['impulse_strength_atr']:.1f}x ATR"
-        for ob in obs[:3]
-    ]) or "  (none active)"
-
-    fvg_summary = "\n".join([
-        f"  - FVG ${fvg['gap_low']:.2f}-${fvg['gap_high']:.2f} (size {fvg['size_atr']:.2f}x ATR), {fvg['bars_since_formed']} bars old"
-        for fvg in fvgs[:3]
-    ]) or "  (none unfilled)"
+    confluence_display = data.get("confluence_display", "N/A")
 
     news_summary = "\n".join([
         f"  - {n.get('title', '')[:100]}"
@@ -294,49 +337,41 @@ def _build_deep_analysis_prompt(ticker: str, data: Dict[str, Any]) -> str:
 COMPANY: {fund.get('name', ticker)}
 SECTOR: {fund.get('sector', 'Unknown')} / {fund.get('industry', 'Unknown')}
 
-=== PRICE & MOMENTUM (1D) ===
-Current price: ${tech.get('price', 0):.2f}
-ATR(14): ${tech.get('atr', 0):.2f}
-RSI(14): {tech.get('rsi', 0):.1f} (zone: {tech.get('rsi_zone', '?')})
-MACD histogram: {tech.get('macd_histogram', 0):.3f} (rising: {tech.get('macd_histogram_rising', False)})
-MACD bullish cross last 5d: {tech.get('macd_bullish_cross_5d', False)}
+=== MANDATORY FILTERS STATUS (all pre-verified as PASS) ===
+Price > EMA(50): PASS
+ADX > 25 + (+DI > -DI): PASS
+RSI > 45: PASS
+Volume ratio > 1.3x: PASS
+ATR > 1.5%: PASS
 
-=== MOVING AVERAGES ===
-SMA20: ${tech.get('sma_20', 0):.2f} | above: {tech.get('above_sma_20', False)}
-SMA50: ${tech.get('sma_50', 0):.2f} | above: {tech.get('above_sma_50', False)}
-SMA200: ${tech.get('sma_200', 0):.2f} | above: {tech.get('above_sma_200', False)}
+=== PRICE & TREND ===
+Current price: ${ind.get('price', 0):.2f}
+EMA(9):  ${ind.get('ema_9', 0):.2f} | EMA(21): ${ind.get('ema_21', 0):.2f} | EMA(50): ${ind.get('ema_50', 0):.2f}
+Above EMA(9):  {ind.get('above_ema_9', False)}
+Above EMA(21): {ind.get('above_ema_21', False)}
+Above EMA(50): True (mandatory filter)
+
+=== MOMENTUM ===
+RSI(14): {ind.get('rsi_14', 0):.1f}
+MACD histogram: {ind.get('macd_histogram', 0):.4f} (positive: {ind.get('macd_positive', False)})
+
+=== TREND STRENGTH ===
+ADX(14): {ind.get('adx_14', 0):.1f}
++DI: {ind.get('plus_di', 0):.1f} | -DI: {ind.get('minus_di', 0):.1f}
+
+=== VOLATILITY ===
+ATR(14): ${ind.get('atr_14', 0):.2f} ({ind.get('atr_pct', 0):.2f}% of price)
 
 === VOLUME ===
-Current: {tech.get('volume_metrics', {}).get('current_volume', 0):,.0f}
-20-day avg: {tech.get('volume_metrics', {}).get('avg_20d_volume', 0):,.0f}
-Ratio: {tech.get('volume_metrics', {}).get('volume_ratio', 0):.2f}x (surge: {tech.get('volume_metrics', {}).get('is_surge', False)})
+Today: {ind.get('vol_today', 0):,}
+14d avg: {ind.get('vol_avg_14d', 0):,}
+Ratio: {ind.get('vol_ratio_14d', 0):.2f}x
 
-=== SMC: ORDER BLOCKS (Bullish, Active) ===
-{ob_summary}
+=== CONFLUENCE (informational) ===
+{confluence_display}
 
-=== SMC: UNFILLED FVGs ===
-{fvg_summary}
-
-=== SMC: STRUCTURE ===
-BOS bullish: {structure.get('bos_bullish', False)}
-CHoCH bearish: {structure.get('choch_bearish', False)}
-Last swing high: ${structure.get('last_swing_high', 0):.2f}
-Last swing low: ${structure.get('last_swing_low', 0):.2f}
-
-=== SMC: LIQUIDITY ===
-Bullish sweep detected: {liq_sweep.get('liquidity_sweep_bullish', False)}
-Swept low level: ${liq_sweep.get('swept_swing_low', 0):.2f}
-
-=== SMC: ZONE ===
-Current zone: {zone.get('zone', 'unknown')} (recommendation: {zone.get('recommendation', '?')})
-Fib position: {zone.get('fib_position_pct', 0):.1f}% of swing range
-
-=== MULTI-TIMEFRAME TRENDS ===
-1W: {mtf.get('1wk', {}).get('trend', '?')}
-1D: {mtf.get('1d', {}).get('trend', '?')}
-4H: {mtf.get('4h', {}).get('trend', '?')}
-1H: {mtf.get('1h', {}).get('trend', '?')}
-HTF aligned bullish: {mtf.get('htf_aligned_bullish', False)}
+=== WEEKLY TREND (1W) ===
+1W trend: {data.get('weekly_trend', 'unknown')}
 
 === FUNDAMENTALS ===
 Market cap: ${fund.get('market_cap', 0):,.0f}
@@ -348,13 +383,10 @@ Revenue growth: {fund.get('revenue_growth', 'N/A')}
 Earnings growth: {fund.get('earnings_growth', 'N/A')}
 
 === MACRO REGIME ===
-SPY: ${macro.get('spy_price', 0):.2f} (vs 200MA: above={macro.get('spy_above_200ma', False)})
+SPY: ${macro.get('spy_price', 0):.2f} (above 200MA: {macro.get('spy_above_200ma', False)})
 SPY 5d change: {macro.get('spy_5d_change_pct', 0):+.2f}%
-VIX: {macro.get('vix', 0):.1f} (panic mode: {macro.get('vix_panic', False)})
-DXY: {macro.get('dxy', 0):.2f}
+VIX: {macro.get('vix', 0):.2f} (panic: {macro.get('vix_panic', False)})
 10Y yield: {macro.get('10y_yield', 'N/A')}
-Fed funds: {macro.get('fed_funds', 'N/A')}
-Yield curve inverted: {macro.get('yield_curve_inverted', False)}
 Sector ({fund.get('sector', '?')}) 5d perf: {macro.get('sector_5d_perf', {}).get(fund.get('sector', ''), 'N/A')}%
 
 === RECENT NEWS ===
@@ -362,49 +394,20 @@ Sector ({fund.get('sector', '?')}) 5d perf: {macro.get('sector_5d_perf', {}).get
 
 === TASK ===
 Produce full trade signal JSON per the system prompt schema.
-Account size: $100. Max risk: $3 (3%). Min RR: 2:1.
+Account: $100. Max risk: $3 (3%). Min RR: 2:1.
+Pass through confluence_display exactly as shown above.
 """
 
 
 # ============================================================
-# UTILITY: TOKEN/COST TRACKING
+# UTILITY — COST TRACKING
 # ============================================================
 
 def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
-    """Rough cost estimate per Anthropic April 2026 pricing."""
+    """Rough cost estimate (Anthropic May 2026 pricing)."""
     rates = {
         "claude-haiku-4-5-20251001": (1.0, 5.0),
-        "claude-opus-4-7": (5.0, 25.0),
+        "claude-opus-4-20250514": (15.0, 75.0),
     }
-    in_rate, out_rate = rates.get(model, (5.0, 25.0))
+    in_rate, out_rate = rates.get(model, (15.0, 75.0))
     return (input_tokens / 1_000_000 * in_rate) + (output_tokens / 1_000_000 * out_rate)
-
-
-if __name__ == "__main__":
-    # Quick smoke test (requires ANTHROPIC_API_KEY env var)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-    # Test Haiku filter
-    test_brief = {
-        "sector": "Technology",
-        "price": 208.50,
-        "rsi": 58.2,
-        "rsi_zone": "neutral_bullish",
-        "macd_histogram": 0.45,
-        "macd_histogram_rising": True,
-        "macd_bullish_cross_5d": True,
-        "above_sma_20": True,
-        "above_sma_50": True,
-        "above_sma_200": True,
-        "volume_ratio": 1.8,
-        "num_order_blocks": 1,
-        "num_fvgs": 1,
-        "bos_bullish": True,
-        "choch_bearish": False,
-        "zone": "discount",
-        "htf_aligned_bullish": True,
-        "macro_regime": "risk_on_bull",
-    }
-    print("\n=== Haiku Filter Test (NVDA) ===")
-    result = haiku_filter_candidate("NVDA", test_brief)
-    print(json.dumps(result, indent=2))
