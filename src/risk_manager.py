@@ -146,7 +146,8 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
             )
 
         # Soft warning: below 2:1 guideline (does NOT reject)
-        elif actual_rr < config.MIN_RR_RATIO:
+        # Tolerance of 0.01 avoids false warning on exactly 2.0 (floating point edge case)
+        if actual_rr < config.MIN_RR_RATIO - 0.01:
             warning = (
                 f"⚠️ RR {actual_rr:.2f} below {config.MIN_RR_RATIO}:1 guideline — "
                 f"review setup quality before entry"
