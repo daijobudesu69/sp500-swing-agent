@@ -1,9 +1,9 @@
 name: Daily Swing Signal — Morning Jakarta
+
 on:
   schedule:
-    # Primary: 01:00 UTC = 8:00 AM Jakarta
     - cron: '0 1 * * 2-6'
-  workflow_dispatch:  # manual trigger from Actions tab
+  workflow_dispatch:
 
 jobs:
   run-daily-pipeline:
@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6        # ✅ fix dari v5
 
       - name: Setup Python 3.11
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6   # ✅ confirmed v6 exists
         with:
           python-version: '3.11'
           cache: 'pip'
