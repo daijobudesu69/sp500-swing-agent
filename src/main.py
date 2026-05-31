@@ -30,13 +30,26 @@ PIPELINE FLOW:
   6. Opus deep analysis
   7. Risk manager validation
   8. Send to Telegram
+  9. Shadow log append (CSV + Telegram)
 
 BLACK SWAN (separate 15-min entry point):
   Type A — Crash:      VIX spike + SPY drop → HALT + defensive ideas via Opus
   Type B — Rally:      VIX drop + SPY surge → continue + sector alert
   Type C — Info:       RSS keyword detection + VIX move → info alert only
+
+PHASE 2.3 REVISION (June 2026):
+================================
+ADDED:
+  - RS gap vs SPY (soft F7 context) computed once before screener loop,
+    stored as rs_gap_vs_spy_pct in each candidate dict. NOT a hard gate.
+  - Shadow log append after send_daily_signals():
+    Writes auto-logged fields to shadow_log.csv (config.SHADOW_LOG_PATH).
+    Manual outcome fields (_shadow_ema9_filled, _shadow_outcome, etc.)
+    are left blank for manual fill-in after trade closes.
 """
+import csv
 import logging
+import os
 import sys
 import time
 import traceback
@@ -114,6 +127,104 @@ def assess_macro_regime(macro_ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
+# SHADOW LOG — CSV APPEND
+# ============================================================
+
+def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
+    """
+    Append auto-logged shadow fields for each approved signal to shadow_log.csv.
+    Manual outcome fields are written as empty strings for manual fill-in later.
+
+    Fields written:
+      Auto: date, ticker, close_price, ema9_price, ema9_gap_pct, ema9_ext_atr,
+            atr, atr_pct, rs_gap_vs_spy, spy_10d_return, stock_10d_return,
+            conviction, confluence_count, haiku_score, adx, rsi, volume_ratio,
+            entry_close, entry_ema9, stop, tp1, tp2, rr
+      Manual (blank): ema9_filled, outcome, r_realized, hold_days
+    """
+    log_path = getattr(config, "SHADOW_LOG_PATH", "shadow_log.csv")
+
+    fieldnames = [
+        # Auto-logged
+        "_shadow_date",
+        "_shadow_ticker",
+        "_shadow_close_price",
+        "_shadow_ema9_price",
+        "_shadow_ema9_gap_pct",
+        "_shadow_ema9_ext_atr",
+        "_shadow_atr",
+        "_shadow_atr_pct",
+        "_shadow_rs_gap_vs_spy",
+        "_shadow_spy_10d_return",
+        "_shadow_stock_10d_return",
+        "_shadow_conviction",
+        "_shadow_confluence_count",
+        "_shadow_haiku_score",
+        "_shadow_adx",
+        "_shadow_rsi",
+        "_shadow_volume_ratio",
+        "_shadow_entry_close",
+        "_shadow_entry_ema9",
+        "_shadow_stop",
+        "_shadow_tp1",
+        "_shadow_tp2",
+        "_shadow_rr",
+        # Manual fill-in (blank on write)
+        "_shadow_ema9_filled",
+        "_shadow_outcome",
+        "_shadow_r_realized",
+        "_shadow_hold_days",
+    ]
+
+    file_exists = os.path.isfile(log_path)
+
+    try:
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+
+            for sig in signals:
+                ind = sig.get("_shadow_indicators", {})
+                row = {
+                    "_shadow_date": run_date,
+                    "_shadow_ticker": sig.get("ticker", ""),
+                    "_shadow_close_price": ind.get("close_price", ""),
+                    "_shadow_ema9_price": ind.get("ema9_price", ""),
+                    "_shadow_ema9_gap_pct": ind.get("ema9_gap_pct", ""),
+                    "_shadow_ema9_ext_atr": ind.get("ema9_ext_atr", ""),
+                    "_shadow_atr": ind.get("atr", ""),
+                    "_shadow_atr_pct": ind.get("atr_pct", ""),
+                    "_shadow_rs_gap_vs_spy": ind.get("rs_gap_vs_spy", ""),
+                    "_shadow_spy_10d_return": ind.get("spy_10d_return", ""),
+                    "_shadow_stock_10d_return": ind.get("stock_10d_return", ""),
+                    "_shadow_conviction": sig.get("conviction", ""),
+                    "_shadow_confluence_count": ind.get("confluence_count", ""),
+                    "_shadow_haiku_score": sig.get("_haiku_score", ""),
+                    "_shadow_adx": ind.get("adx", ""),
+                    "_shadow_rsi": ind.get("rsi", ""),
+                    "_shadow_volume_ratio": ind.get("volume_ratio", ""),
+                    "_shadow_entry_close": ind.get("entry_close", ""),
+                    "_shadow_entry_ema9": sig.get("entry", ""),     # Opus sets entry = EMA9
+                    "_shadow_stop": sig.get("stop_loss", ""),
+                    "_shadow_tp1": sig.get("tp1", ""),
+                    "_shadow_tp2": sig.get("tp2", ""),
+                    "_shadow_rr": sig.get("rr_ratio", ""),
+                    # Manual — blank on write
+                    "_shadow_ema9_filled": "",
+                    "_shadow_outcome": "",
+                    "_shadow_r_realized": "",
+                    "_shadow_hold_days": "",
+                }
+                writer.writerow(row)
+
+        logger.info(f"Shadow log appended: {len(signals)} row(s) → {log_path}")
+
+    except Exception as e:
+        logger.error(f"Shadow log append failed: {e}")
+
+
+# ============================================================
 # MANDATORY SCREENER (Stage 2 — replaces SMC screen)
 # ============================================================
 
@@ -132,12 +243,35 @@ def run_mandatory_screener(
       4. Volume ratio (14d avg) > 1.3x
       5. ATR(14) > 1.5% of price
 
+    Phase 2.3 — Soft F7 (NOT a hard gate):
+      Computes rs_gap_vs_spy_pct (stock 10d return - SPY 10d return) for each
+      candidate and stores it in the candidate dict + brief_data for Haiku context.
+      SPY is fetched ONCE before the loop (not per ticker).
+
     Returns list of candidates with brief_data attached.
     """
     candidates = []
     errors = 0
     total = len(universe_df)
     logger.info(f"Screening {total} tickers via mandatory 5-filter screener...")
+
+    # --------------------------------------------------------
+    # Phase 2.3: Fetch SPY 10d return ONCE before the loop (soft F7 context)
+    # --------------------------------------------------------
+    spy_10d_return = 0.0
+    try:
+        spy_df = data_mod.fetch_ohlcv("SPY", period="3mo", interval="1d")
+        rs_lookback = getattr(config, "RS_LOOKBACK_DAYS", 10)
+        if spy_df is not None and len(spy_df) >= rs_lookback + 1:
+            spy_close = spy_df["Close"]
+            spy_end = float(spy_close.iloc[-1])
+            spy_start = float(spy_close.iloc[-(rs_lookback + 1)])
+            spy_10d_return = ((spy_end - spy_start) / spy_start) * 100
+            logger.info(f"SPY {rs_lookback}d return: {spy_10d_return:+.2f}%")
+        else:
+            logger.warning("SPY data insufficient for RS gap — defaulting to 0.0%")
+    except Exception as e:
+        logger.warning(f"SPY fetch for RS gap failed: {e} — defaulting to 0.0%")
 
     for i, (_, row) in enumerate(universe_df.iterrows()):
         ticker = row["ticker"]
@@ -156,6 +290,28 @@ def run_mandatory_screener(
                 continue
 
             if brief.get("all_mandatory_pass"):
+                # ------------------------------------------------
+                # Phase 2.3: Compute soft F7 — RS gap vs SPY
+                # NOT a gate. Stored for Haiku penalisation context.
+                # ------------------------------------------------
+                rs_gap_vs_spy_pct = 0.0
+                stock_10d_return = 0.0
+                try:
+                    rs_lookback = getattr(config, "RS_LOOKBACK_DAYS", 10)
+                    if len(df) >= rs_lookback + 1:
+                        stock_close = df["Close"]
+                        stock_end = float(stock_close.iloc[-1])
+                        stock_start = float(stock_close.iloc[-(rs_lookback + 1)])
+                        stock_10d_return = ((stock_end - stock_start) / stock_start) * 100
+                        rs_gap_vs_spy_pct = stock_10d_return - spy_10d_return
+                except Exception as rs_err:
+                    logger.debug(f"RS gap compute failed for {ticker}: {rs_err}")
+
+                # Inject into brief_data so Haiku receives it
+                brief["rs_gap_vs_spy_pct"] = round(rs_gap_vs_spy_pct, 2)
+                brief["stock_10d_return"] = round(stock_10d_return, 2)
+                brief["spy_10d_return"] = round(spy_10d_return, 2)
+
                 candidates.append({
                     "ticker": ticker,
                     "sector": row.get("sector", "Unknown"),
@@ -274,9 +430,10 @@ def run_daily_signals() -> Dict[str, Any]:
     Triggered by GitHub Actions cron at 01:00 UTC (8:00 AM WIB).
     """
     start_time = time.time()
+    run_date = datetime.utcnow().strftime("%Y-%m-%d")
     logger.info("=" * 60)
     logger.info("DAILY SIGNAL PIPELINE — STARTING")
-    logger.info(f"Run timestamp: {datetime.utcnow().isoformat()}Z")
+    logger.info(f"Run timestamp: {run_date}T{datetime.utcnow().strftime('%H:%M:%S')}Z")
     logger.info("=" * 60)
 
     result = {
@@ -327,7 +484,7 @@ def run_daily_signals() -> Dict[str, Any]:
         }
 
         # --------------------------------------------------------
-        # STAGE 3: Mandatory 5-filter screener (Stage 2 replacement)
+        # STAGE 3: Mandatory 5-filter screener + soft RS gap (F7)
         # --------------------------------------------------------
         t = time.time()
         candidates = run_mandatory_screener(universe_df, regime["regime"])
@@ -389,6 +546,8 @@ def run_daily_signals() -> Dict[str, Any]:
                 continue
             signal = analyst_mod.opus_deep_analysis(ticker, full_data)
             if "error" not in signal:
+                # Carry haiku score forward for shadow log
+                signal["_haiku_score"] = cand.get("score", "")
                 deep_signals.append(signal)
                 logger.info(
                     f"Opus {ticker}: conviction={signal.get('conviction', '?')}"
@@ -435,6 +594,16 @@ def run_daily_signals() -> Dict[str, Any]:
         result["stage_timings"]["telegram_send"] = round(time.time() - t, 2)
         result["signals_sent"] = len(approved) if sent_ok else 0
         result["status"] = "success" if sent_ok else "telegram_failed"
+
+        # --------------------------------------------------------
+        # STAGE 8: Shadow log append (Phase 2.3)
+        # Runs after Telegram send — non-blocking, never gates the pipeline
+        # --------------------------------------------------------
+        try:
+            _append_shadow_log(approved, run_date)
+            tg_mod.send_shadow_log(approved, run_date)
+        except Exception as shadow_err:
+            logger.warning(f"Shadow log step failed (non-critical): {shadow_err}")
 
         total = round(time.time() - start_time, 2)
         logger.info(
