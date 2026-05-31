@@ -30,11 +30,22 @@ SAFETY GUARDS:
 All values calibrated to match TradingView rendering:
   - RSI / ATR / ADX use Wilder's smoothing (alpha = 1/period)
   - EMAs use standard span-based EMA
+
+PHASE 2.3 REVISION (June 2026):
+================================
+ADDED (soft context — NOT gating, passed to Haiku as warning inputs):
+  - ema9_extension_pct: (close - EMA9) / close * 100
+  - ema9_ext_atr: (close - EMA9) / ATR14 — F6 soft metric in ATR units
+  - pass_ema9_ext: bool, True if ema9_ext_atr <= EMA9_MAX_EXTENSION_ATR (1.5)
+  These appear in indicators dict, screener dict (soft only), and build_brief_data().
+  pass_ema9_ext is NOT included in all_pass. F1-F5 remain the only hard gates.
 """
 from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
+
+from src import config
 
 
 # ============================================================
@@ -198,6 +209,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
           - 'price': latest close
           - 'indicators': all computed values
           - 'screener': pass/fail for each mandatory + 'all_pass' boolean
+                        + soft F6 fields (pass_ema9_ext, NOT in all_pass)
           - 'confluence': MACD/EMA9/EMA21 booleans + count + display string
           - 'error' (optional): if data is insufficient or invalid
     """
@@ -241,6 +253,17 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     vol_ratio = vol_today / vol_avg_14 if vol_avg_14 > 0 else 0.0
 
     # ============================================================
+    # PHASE 2.3 — SOFT F6 METRICS (context only, NOT gating)
+    # ema9_extension_pct: how far close is above EMA9 as % of close
+    # ema9_ext_atr: same distance measured in ATR units
+    # pass_ema9_ext: True if within threshold — informational flag for Haiku
+    # ============================================================
+    ema9_extension_pct = ((price - ema_9) / price * 100) if price > 0 else 0.0
+    ema9_ext_atr = (price - ema_9) / atr_14 if atr_14 > 0 else 0.0
+    ema9_max_ext = getattr(config, "EMA9_MAX_EXTENSION_ATR", 1.5)
+    pass_ema9_ext = ema9_ext_atr <= ema9_max_ext  # soft — NOT in all_pass
+
+    # ============================================================
     # MANDATORY SCREENER (5 filters — ALL must pass)
     # ============================================================
     pass_ema_50 = price > ema_50
@@ -249,6 +272,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     pass_volume = vol_ratio > 1.3
     pass_atr = atr_pct > 1.5
 
+    # all_pass = F1-F5 only. F6 (pass_ema9_ext) is soft context — never gates here.
     all_pass = all([pass_ema_50, pass_adx_di, pass_rsi, pass_volume, pass_atr])
 
     # ============================================================
@@ -282,6 +306,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             "vol_ratio_14d": round(vol_ratio, 2),
             "vol_today": int(vol_today),
             "vol_avg_14d": int(vol_avg_14),
+            # Phase 2.3 soft F6 metrics
+            "ema9_extension_pct": round(ema9_extension_pct, 2),
+            "ema9_ext_atr": round(ema9_ext_atr, 2),
         },
         "screener": {
             "pass_ema_50": bool(pass_ema_50),
@@ -290,6 +317,8 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             "pass_volume": bool(pass_volume),
             "pass_atr": bool(pass_atr),
             "all_pass": bool(all_pass),
+            # Soft F6 — informational only, NOT part of all_pass
+            "pass_ema9_ext": bool(pass_ema9_ext),
         },
         "confluence": {
             "macd_positive": bool(conf_macd),
@@ -321,6 +350,8 @@ def build_brief_data(df: pd.DataFrame, ticker: str = "",
         These ALL must pass for the signal to exist.
       - OPTIONAL confluence (3): EMA9, EMA21, MACD histogram
         These are informational — boost conviction but don't gate.
+      - SOFT WARNINGS (Phase 2.3): ema9_extension_pct, ema9_ext_atr, pass_ema9_ext
+        Passed to Haiku as context for penalisation. NOT hard gates.
     """
     result = compute_indicators(df)
     if "error" in result:
@@ -363,6 +394,11 @@ def build_brief_data(df: pd.DataFrame, ticker: str = "",
         "macd_histogram": ind["macd_histogram"],
         "macd_positive": conf["macd_positive"],
 
+        # ===== SOFT WARNINGS — Phase 2.3 (context for Haiku, NOT hard gates) =====
+        "ema9_extension_pct": ind["ema9_extension_pct"],   # % above EMA9
+        "ema9_ext_atr": ind["ema9_ext_atr"],               # extension in ATR units
+        "pass_ema9_ext": scr["pass_ema9_ext"],             # True if <= 1.5×ATR
+
         # ===== AGGREGATE STATUS =====
         "all_mandatory_pass": scr["all_pass"],
         "confluence_count": conf["count"],
@@ -394,4 +430,7 @@ if __name__ == "__main__":
         print(f"Indicators: {result['indicators']}")
         print(f"Screener: {result['screener']}")
         print(f"Confluence: {result['confluence']['display']}")
-        print(f"PASSES SCREEN: {result['screener']['all_pass']}\n")
+        print(f"PASSES SCREEN: {result['screener']['all_pass']}")
+        print(f"EMA9 ext: {result['indicators']['ema9_ext_atr']:.2f}×ATR "
+              f"({result['indicators']['ema9_extension_pct']:.2f}%) "
+              f"— soft pass: {result['screener']['pass_ema9_ext']}\n")
