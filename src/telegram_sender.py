@@ -163,7 +163,7 @@ def _format_soft_warning_line(label: str, value: float, unit: str,
 
     status = "⚠" if breached else "✓"
     range_label = "EXTENDED" if breached else "within range"
-    return f"- {label}: {value:.2f}{unit} — {range_label} {status}\n"
+    return f"- {label} — {range_label} {status}\n"
 
 
 def _format_signal(signal: Dict[str, Any]) -> str:
@@ -188,10 +188,6 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     rr1 = float(signal.get("rr_ratio", 0))
     rr2 = float(signal.get("rr_extended", 0))
 
-    pos_size = float(signal.get("position_size_usd", 0))
-    shares = float(signal.get("shares", 0))
-    risk = float(signal.get("risk_amount_usd", 0))
-
     stop_pct = ((stop - entry) / entry * 100) if entry > 0 else 0
     tp1_pct = ((tp1 - entry) / entry * 100) if entry > 0 else 0
     tp2_pct = ((tp2 - entry) / entry * 100) if entry > 0 else 0
@@ -206,11 +202,6 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     msg += f"Stop:  `${stop:.2f}` ({stop_pct:+.2f}%)\n"
     msg += f"TP1:   `${tp1:.2f}` ({tp1_pct:+.2f}%, RR {rr1:.2f})\n"
     msg += f"TP2:   `${tp2:.2f}` ({tp2_pct:+.2f}%, RR {rr2:.2f})\n\n"
-
-    # ── Sizing ───────────────────────────────────────────────
-    msg += "📦 *Sizing (reference)*\n"
-    msg += f"Position: ${pos_size:.2f} ({shares:.4f} shares)\n"
-    msg += f"Risk:     ${risk:.2f}\n\n"
 
     # ── Mandatory filters (all 5 passed by definition) ──────
     msg += f"{config.MANDATORY_PASS_EMOJI} *MANDATORY* (all 5 passed)\n"
