@@ -26,6 +26,16 @@ ADDED:
     EMA_TREND_ANCHOR_PERIOD, ADX_THRESHOLD, RSI_MIN,
     VOLUME_RATIO_MIN, ATR_PCT_MIN
   - LLM_HAIKU_TOP_N (number promoted to Opus)
+
+PHASE 2.3 REVISION (June 2026):
+================================
+CHANGED:
+  - EMA9_MAX_EXTENSION_PCT (2%) → EMA9_MAX_EXTENSION_ATR = 1.5 (ATR units, not %)
+    F6 demoted from hard gate to soft Haiku context
+  - RS_MIN_GAP_VS_SPY: -0.03 → -0.035
+    F7 demoted from hard gate to soft Haiku context
+ADDED:
+  - SHADOW_LOG_PATH = "shadow_log.csv"
 """
 import os
 from zoneinfo import ZoneInfo
@@ -113,6 +123,26 @@ EMA_MEDIUM_PERIOD = 21
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
+
+# ============================================================
+# SOFT WARNINGS — F6 & F7 (context passed to Haiku, NOT hard gates)
+# Phase 2.3: demoted from mandatory filters
+# ============================================================
+# F6: Anti-exhaustion — extension of close above EMA9, measured in ATR units
+# Penalise in Haiku scoring if > 1.5×ATR (extended entry risk)
+EMA9_MAX_EXTENSION_ATR = 1.5            # (close - EMA9) / ATR threshold
+
+# F7: Relative strength vs SPY — 10-day return gap
+# Penalise in Haiku scoring if < -3.5% (sector laggard risk)
+RS_LOOKBACK_DAYS = 10
+RS_MIN_GAP_VS_SPY = -0.035              # stock 10d return - SPY 10d return
+
+
+# ============================================================
+# SHADOW LOGGING (Phase 2.3)
+# ============================================================
+SHADOW_LOG_PATH = "shadow_log.csv"
 
 
 # ============================================================
