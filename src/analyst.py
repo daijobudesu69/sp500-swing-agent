@@ -24,6 +24,21 @@ Pipeline:
   1. Mandatory screener (in indicators.py) → 5-10 candidates
   2. Haiku 4.5 quality scoring → keep top N (default 5)
   3. Opus 4.7 deep analysis → full thesis with entry/stop/TP/conviction
+
+PHASE 2.3 REVISION (June 2026):
+================================
+HAIKU CHANGES:
+  - Scoring weights updated: filter strength 50%, fundamentals 30%, news 20%
+  - Confluence reward REMOVED from scoring (data showed 3/3 = 71% loss rate)
+  - Confluence count passed as neutral context only
+  - F6 soft warning added to Haiku user prompt (ema9_ext_atr)
+  - F7 soft warning added to Haiku user prompt (rs_gap_vs_spy_pct)
+
+OPUS CHANGES:
+  - Entry changed from yesterday's close to EMA9 value (limit order)
+  - Entry = ema_9 value from brief_data (already in prompt data)
+  - Stop / TP1 / TP2 all computed from EMA9 entry
+  - Shadow fields added to Opus output dict (_shadow_indicators)
 """
 import json
 import logging
@@ -69,15 +84,25 @@ Universe: S&P 500 stocks ONLY.
 Holding period: 1 day to 1 week max.
 Direction: LONG ONLY.
 
-RATING CRITERIA (focus on these):
-  1. Trend quality — how clean and strong is the uptrend? (EMA alignment, ADX strength)
-  2. Entry timing — is price at a good risk/reward entry point or already extended?
-  3. Momentum conviction — MACD histogram, volume surge quality
-  4. Macro regime fit — does the sector/stock benefit from current macro?
-  5. Fundamental quality — is the business backing the technical move?
+SCORING WEIGHTS (use these explicitly):
+  Filter strength    50% — how far above threshold each F1-F5 passed
+                          (e.g. ADX 38 >> ADX 26, RSI 65 >> RSI 46)
+                          Reward strong filter margin, penalise borderline passes.
+  Fundamental quality 30% — revenue growth, earnings trend, sector momentum
+  News sentiment      20% — catalyst presence, analyst upgrades, risk events
+
+CONFLUENCE NOTE (IMPORTANT):
+  Confluence count (0/1/2/3: MACD, EMA9, EMA21) is provided as context ONLY.
+  Do NOT reward higher confluence counts. Data shows 3/3 confluence = 71% loss rate.
+  Treat it as neutral information. Do NOT penalise low confluence counts either.
+
+SOFT WARNINGS (penalise if severe — do not hard-reject):
+  EMA9 extension > 1.5×ATR → penalise (extended entry risk, likely buying the surge)
+  RS gap vs SPY < -3.5% → penalise (sector laggard in relative terms)
+  Penalise proportionally: 2.0×ATR extension is mild; 3.0×ATR is severe.
 
 SCORING GUIDE:
-  80-100 = Exceptional setup. Strong trend, clean entry, volume confirmed, macro aligned.
+  80-100 = Exceptional setup. Strong filter margins, clean fundamentals, macro aligned.
   65-79  = Good setup. Most criteria met, minor concerns.
   50-64  = Watchlist only. Passes filters but lacks conviction.
   < 50   = Weak. Skip even though it passed mandatory filters.
@@ -87,8 +112,8 @@ OUTPUT FORMAT: JSON only. No prose, no explanation outside JSON.
 
 Rules:
   - Be CRITICAL. Only ~30% of candidates should score >= 65.
-  - Penalize stocks that are extended (RSI near 80, far above EMAs).
-  - Reward stocks showing fresh momentum (MACD turning positive, volume surging today).
+  - Penalize stocks that are extended (RSI near 80, far above EMAs in ATR terms).
+  - Reward stocks with strong ADX margin (38 vs 26), volume well above average.
   - Consider if the setup is early enough for a 7-day hold to generate 2:1 RR.
 """
 
@@ -124,12 +149,15 @@ CONVICTION TIERS:
   50-64  = WATCHLIST (do not enter — flag only)
   < 50   = SKIP
 
-POSITION SIZING:
+ENTRY AND POSITION SIZING:
   Account: $100. Max risk per trade: 3% ($3).
+  Entry = EMA9 value (provided in prompt data as ema_9).
+         This is a LIMIT ORDER — you place the limit at EMA9 before US open.
+         If price never pulls back to EMA9, the order does not fill. That is correct.
+  Stop  = Entry - (1.5 x ATR)
+  TP1   = Entry + (2.0 x (Entry - Stop))
+  TP2   = Entry + (3.0 x (Entry - Stop))
   Position size = Risk / (Entry - Stop)
-  Stop = Entry - (1.5 x ATR)
-  TP1  = Entry + (2.0 x (Entry - Stop))
-  TP2  = Entry + (3.0 x (Entry - Stop))
 
 OUTPUT: Strict JSON only. No prose outside JSON.
 {
@@ -163,6 +191,7 @@ OUTPUT: Strict JSON only. No prose outside JSON.
 
 CRITICAL RULES:
   - LONG only (entry > stop_loss ALWAYS — if not, output is rejected)
+  - Entry MUST equal the ema_9 value provided. Do not use close price as entry.
   - RR: calculate accurately. If RR < 2:1, report it honestly — do NOT auto-cap conviction. User decides entry.
   - Risk amount must be <= $3.00
   - Be honest. Mediocre setup = mediocre score.
@@ -226,8 +255,14 @@ ATR(14): ${brief_data.get('atr_14', 0):.2f} ({brief_data.get('atr_pct', 0):.2f}%
 === VOLUME ===
 Volume ratio vs 14d avg: {brief_data.get('vol_ratio_14d', 0):.2f}x (surge: {brief_data.get('vol_surge', False)})
 
-=== CONFLUENCE ===
+=== CONFLUENCE (context only — do NOT reward higher counts) ===
 {brief_data.get('confluence_display', 'N/A')}
+
+=== SOFT WARNINGS (penalise if severe) ===
+EMA9 extension: {brief_data.get('ema9_extension_pct', 0):.1f}% ({brief_data.get('ema9_ext_atr', 0):.2f}× ATR)
+  → Penalise if > 1.5×ATR (extended entry risk)
+RS gap vs SPY (10d): {brief_data.get('rs_gap_vs_spy_pct', 0):.1f}%
+  → Penalise if < -3.5% (sector laggard risk)
 
 === MACRO ===
 Regime: {brief_data.get('macro_regime', 'unknown')}
@@ -296,7 +331,7 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
     """
     Full thesis generation for a strong candidate.
     Input: comprehensive data from data_fetcher + indicators.
-    Output: full trade signal JSON.
+    Output: full trade signal JSON + _shadow_indicators dict for logging.
     """
     client = get_client()
     user_prompt = _build_deep_analysis_prompt(ticker, full_data)
@@ -318,6 +353,30 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
         parsed["_tokens_used"] = response.usage.input_tokens + response.usage.output_tokens
         parsed["_input_tokens"] = response.usage.input_tokens
         parsed["_output_tokens"] = response.usage.output_tokens
+
+        # --------------------------------------------------------
+        # Phase 2.3: Attach shadow indicator snapshot for logging
+        # Carries indicator values at signal time into the signal dict
+        # so _append_shadow_log() can read them without re-fetching data.
+        # --------------------------------------------------------
+        ind = full_data.get("indicators", {})
+        parsed["_shadow_indicators"] = {
+            "close_price": ind.get("price", ""),
+            "ema9_price": ind.get("ema_9", ""),
+            "ema9_gap_pct": ind.get("ema9_extension_pct", ""),
+            "ema9_ext_atr": ind.get("ema9_ext_atr", ""),
+            "atr": ind.get("atr_14", ""),
+            "atr_pct": ind.get("atr_pct", ""),
+            "rs_gap_vs_spy": ind.get("rs_gap_vs_spy_pct", ""),
+            "spy_10d_return": ind.get("spy_10d_return", ""),
+            "stock_10d_return": ind.get("stock_10d_return", ""),
+            "confluence_count": ind.get("confluence_count", ""),
+            "adx": ind.get("adx_14", ""),
+            "rsi": ind.get("rsi_14", ""),
+            "volume_ratio": ind.get("vol_ratio_14d", ""),
+            "entry_close": ind.get("price", ""),   # close price at signal time
+        }
+
         return parsed
     except json.JSONDecodeError as e:
         logger.error(f"Opus JSON parse failed for {ticker}: {e} | raw: {raw_text[:300]}")
@@ -345,6 +404,7 @@ COMPANY: {fund.get('name', ticker)}
 SECTOR: {fund.get('sector', 'Unknown')} / {fund.get('industry', 'Unknown')}
 
 Current price: ${ind.get('price', 0):.2f}
+EMA9 (LIMIT ENTRY): ${ind.get('ema_9', 0):.2f}
 
 === 🔒 MANDATORY FILTERS (all pre-verified as PASS — these gated the signal) ===
 
@@ -363,7 +423,7 @@ Current price: ${ind.get('price', 0):.2f}
   5. ATR(14) > 1.5% of price: PASS
      ATR=${ind.get('atr_14', 0):.2f} ({ind.get('atr_pct', 0):.2f}% of price)
 
-=== ➕ OPTIONAL CONFLUENCE (informational — boosts conviction, does NOT gate) ===
+=== ➕ OPTIONAL CONFLUENCE (informational — displayed only, does NOT gate) ===
 
   - MACD histogram > 0: {ind.get('macd_positive', False)}
     Value: {ind.get('macd_histogram', 0):.4f}
@@ -373,6 +433,12 @@ Current price: ${ind.get('price', 0):.2f}
     EMA9 = ${ind.get('ema_9', 0):.2f}
 
 Confluence score: {confluence_display}
+
+=== ⚠️ SOFT WARNINGS (context — factor into conviction, not a veto) ===
+
+  EMA9 extension: {ind.get('ema9_extension_pct', 0):.1f}% ({ind.get('ema9_ext_atr', 0):.2f}× ATR)
+  RS gap vs SPY (10d): {ind.get('rs_gap_vs_spy_pct', 0):.1f}%
+    (Stock {ind.get('stock_10d_return', 0):.1f}% vs SPY {ind.get('spy_10d_return', 0):.1f}%)
 
 === 📅 WEEKLY TREND (TIER 1 input) ===
 1W trend: {data.get('weekly_trend', 'unknown')}
@@ -400,6 +466,8 @@ Sector ({fund.get('sector', '?')}) 5d perf: {macro.get('sector_5d_perf', {}).get
 === TASK ===
 Produce full trade signal JSON per the system prompt schema.
 Account: $100. Max risk: $3 (3%). Min RR: 2:1.
+ENTRY MUST BE EMA9 = ${ind.get('ema_9', 0):.2f} (limit order — NOT close price).
+Stop = EMA9 - (1.5 × ATR). TP1 = EMA9 + (2 × risk). TP2 = EMA9 + (3 × risk).
 Pass through confluence_display exactly as shown above.
 """
 
