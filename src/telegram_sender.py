@@ -10,8 +10,21 @@ ADDED:
   - Type A black swan defensive ideas display
   - Type B/C alert formatting
 
+PHASE 2.3 REVISION (June 2026):
+================================
+CHANGED:
+  - Entry line: now shows EMA9 limit price (not yesterday's close)
+  - Confluence label: "context only" — no longer implies quality signal
+  - Soft warnings section added: F6 (EMA9 ext) + F7 (RS gap vs SPY)
+    Shows ✓ if within range, ⚠ if breaching threshold
+  - Removed: max_holding_days line (per user revision)
+
+ADDED:
+  - send_shadow_log(): sends shadow log summary message after daily signals
+
 FUNCTIONS:
   send_daily_signals()       — Main signal delivery (header + each signal)
+  send_shadow_log()          — Shadow log summary (after daily signals)
   send_no_signal_day()       — Explain why no signals fired
   send_black_swan_crash()    — Type A alert + defensive ideas
   send_black_swan_rally()    — Type B alert + sector guidance
@@ -84,7 +97,7 @@ def _send_message(
     except requests.exceptions.HTTPError as e:
         # Markdown parse error — retry without parse_mode
         if "can't parse entities" in str(resp.text).lower():
-            logger.warning(f"Markdown parse error, retrying as plain text")
+            logger.warning("Markdown parse error, retrying as plain text")
             payload["parse_mode"] = ""
             try:
                 resp = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
@@ -134,14 +147,41 @@ def _format_macro_header(macro: Dict[str, Any]) -> str:
     )
 
 
+def _format_soft_warning_line(label: str, value: float, unit: str,
+                               threshold: float, breach_direction: str = "above") -> str:
+    """
+    Format a single soft warning line with pass/fail indicator.
+
+    breach_direction:
+      "above"  — breach if value > threshold (F6: ext > 1.5×ATR)
+      "below"  — breach if value < threshold (F7: RS gap < -3.5%)
+    """
+    if breach_direction == "above":
+        breached = value > threshold
+    else:
+        breached = value < threshold
+
+    status = "⚠" if breached else "✓"
+    range_label = "EXTENDED" if breached else "within range"
+    return f"- {label}: {value:.2f}{unit} — {range_label} {status}\n"
+
+
 def _format_signal(signal: Dict[str, Any]) -> str:
-    """Format a single signal into a Telegram message."""
+    """
+    Format a single approved signal into a Telegram message.
+
+    Phase 2.3 changes:
+      - Entry = EMA9 limit price
+      - Confluence label = "context only"
+      - Soft warnings section (F6 + F7)
+      - max_holding_days line removed
+    """
     ticker = signal.get("ticker", "?")
     conviction = int(signal.get("conviction", 0))
     setup = signal.get("setup_type", "N/A")
     emoji, tier_label = _conviction_tier(conviction)
 
-    entry = float(signal.get("entry", 0))
+    entry = float(signal.get("entry", 0))       # Phase 2.3: entry = EMA9
     stop = float(signal.get("stop_loss", 0))
     tp1 = float(signal.get("tp1", 0))
     tp2 = float(signal.get("tp2", 0))
@@ -156,78 +196,89 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     tp1_pct = ((tp1 - entry) / entry * 100) if entry > 0 else 0
     tp2_pct = ((tp2 - entry) / entry * 100) if entry > 0 else 0
 
-    # Header
+    # ── Header ──────────────────────────────────────────────
     msg = f"{emoji} *{ticker}* — {conviction}/100 ({tier_label})\n"
     msg += f"_{setup}_\n\n"
 
-    # Price levels
+    # ── Price levels (Phase 2.3: entry = EMA9 limit) ────────
     msg += "💰 *Levels*\n"
     msg += f"Entry: `${entry:.2f}`\n"
     msg += f"Stop:  `${stop:.2f}` ({stop_pct:+.2f}%)\n"
     msg += f"TP1:   `${tp1:.2f}` ({tp1_pct:+.2f}%, RR {rr1:.2f})\n"
     msg += f"TP2:   `${tp2:.2f}` ({tp2_pct:+.2f}%, RR {rr2:.2f})\n\n"
 
-    # Sizing (informational — user manages capital separately)
+    # ── Sizing ───────────────────────────────────────────────
     msg += "📦 *Sizing (reference)*\n"
     msg += f"Position: ${pos_size:.2f} ({shares:.4f} shares)\n"
     msg += f"Risk:     ${risk:.2f}\n\n"
 
-    # Mandatory section (all 5 passed by definition)
-    mandatory_pass = config.MANDATORY_PASS_EMOJI
-    msg += f"{mandatory_pass} *MANDATORY* (all 5 passed)\n"
+    # ── Mandatory filters (all 5 passed by definition) ──────
+    msg += f"{config.MANDATORY_PASS_EMOJI} *MANDATORY* (all 5 passed)\n"
     msg += "✓ Price > EMA(50)\n"
     msg += "✓ ADX > 25 + (+DI dominant)\n"
     msg += "✓ RSI > 45\n"
     msg += "✓ Volume > 1.3x avg\n"
     msg += "✓ ATR > 1.5% of price\n\n"
 
-    # Optional confluence
+    # ── Confluence (Phase 2.3: "context only" — not predictive) ─
     confluence_display = signal.get("confluence_display", "N/A")
-    confluence_emoji = config.CONFLUENCE_EMOJI
-    msg += f"{confluence_emoji} *CONFLUENCE*: {confluence_display}\n\n"
+    msg += f"{config.CONFLUENCE_EMOJI} *CONFLUENCE* (context only): {confluence_display}\n\n"
 
-    # Conviction breakdown if available
+    # ── Soft warnings (Phase 2.3: F6 + F7) ──────────────────
+    shadow = signal.get("_shadow_indicators", {})
+    ema9_ext_atr = float(shadow.get("ema9_ext_atr", 0))
+    ema9_ext_pct = float(shadow.get("ema9_gap_pct", 0))
+    rs_gap = float(shadow.get("rs_gap_vs_spy", 0))
+
+    ema9_threshold = getattr(config, "EMA9_MAX_EXTENSION_ATR", 1.5)
+    rs_threshold = getattr(config, "RS_MIN_GAP_VS_SPY", -0.035) * 100  # convert to %
+
+    msg += f"{config.WARNING_EMOJI} *SOFT WARNINGS*\n"
+    msg += _format_soft_warning_line(
+        f"EMA9 ext: {ema9_ext_atr:.2f}×ATR ({ema9_ext_pct:.2f}%)",
+        ema9_ext_atr, "", ema9_threshold, breach_direction="above",
+    )
+    msg += _format_soft_warning_line(
+        f"RS vs SPY (10d): {rs_gap:+.1f}%",
+        rs_gap, "", rs_threshold, breach_direction="below",
+    )
+    msg += "\n"
+
+    # ── Score breakdown ──────────────────────────────────────
     breakdown = signal.get("breakdown", {})
     if breakdown:
         msg += "📊 *Score breakdown*\n"
-        msg += f"• Technical:   {breakdown.get('technical', 0)}/30\n"
-        msg += f"• Fundamental: {breakdown.get('fundamental', 0)}/25\n"
-        msg += f"• Macro:       {breakdown.get('macro', 0)}/20\n"
-        msg += f"• News:        {breakdown.get('news_catalyst', 0)}/15\n"
-        msg += f"• RR:          {breakdown.get('rr_asymmetry', 0)}/10\n\n"
+        msg += f"- Technical:   {breakdown.get('technical', 0)}/30\n"
+        msg += f"- Fundamental: {breakdown.get('fundamental', 0)}/25\n"
+        msg += f"- Macro:       {breakdown.get('macro', 0)}/20\n"
+        msg += f"- News:        {breakdown.get('news_catalyst', 0)}/15\n"
+        msg += f"- RR:          {breakdown.get('rr_asymmetry', 0)}/10\n\n"
 
-    # Warnings
+    # ── Risk manager warnings ────────────────────────────────
     rr_warn = signal.get("_rr_warning", "")
     tier_warn = signal.get("_tier1_rr_warning", "")
     warnings_text = ""
     if rr_warn:
-        warnings_text += f"• {rr_warn}\n"
+        warnings_text += f"- {rr_warn}\n"
     if tier_warn:
-        warnings_text += f"• {tier_warn}\n"
+        warnings_text += f"- {tier_warn}\n"
 
-    warning_emoji = config.WARNING_EMOJI
     if warnings_text:
-        msg += f"{warning_emoji} *Warnings*\n{warnings_text}\n"
+        msg += f"{config.WARNING_EMOJI} *Warnings*\n{warnings_text}\n"
     else:
-        msg += f"{warning_emoji} Warnings: None\n\n"
+        msg += f"{config.WARNING_EMOJI} Warnings: None\n\n"
 
-    # Thesis
+    # ── Thesis ───────────────────────────────────────────────
     thesis = signal.get("thesis", "")
     if thesis:
-        thesis_short = thesis[:400]
-        msg += f"💭 *Thesis*\n{thesis_short}\n\n"
+        msg += f"💭 *Thesis*\n{thesis[:400]}\n\n"
 
-    # Invalidation
+    # ── Invalidation ─────────────────────────────────────────
     invalidation = signal.get("invalidation", [])
     if invalidation:
         msg += "❌ *Invalidation*\n"
         for inv in invalidation[:3]:
-            msg += f"• {inv}\n"
-        msg += "\n"
-
-    # Hold period
-    max_days = signal.get("max_holding_days", 7)
-    msg += f"📅 Hold: {max_days} days max"
+            msg += f"- {inv}\n"
 
     return msg
 
@@ -243,7 +294,6 @@ def send_daily_signals(
     """
     Send approved signals via Telegram.
     Sends header message + one message per signal.
-
     Returns True if all messages sent successfully.
     """
     if not signals:
@@ -251,23 +301,20 @@ def send_daily_signals(
         return False
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    header_emoji = config.SIGNAL_HEADER_EMOJI
 
     # Header message
-    header = f"{header_emoji} *DAILY SIGNALS — {today}*\n\n"
+    header = f"{config.SIGNAL_HEADER_EMOJI} *DAILY SIGNALS — {today}*\n\n"
     header += _format_macro_header(macro) + "\n\n"
     header += f"📤 *{len(signals)} signal(s)* approved\n\n"
 
-    # Quick summary list
     for s in signals:
-        emoji, _ = _conviction_tier(s.get("conviction", 0))
-        header += f"{emoji} {s.get('ticker')} — {s.get('conviction')}/100\n"
+        sig_emoji, _ = _conviction_tier(s.get("conviction", 0))
+        header += f"{sig_emoji} {s.get('ticker')} — {s.get('conviction')}/100\n"
 
     success = _send_message(header)
     if not success:
         logger.error("Failed to send signals header")
 
-    # Each signal as own message
     all_ok = success
     for sig in signals:
         ok = _send_message(_format_signal(sig))
@@ -276,6 +323,63 @@ def send_daily_signals(
             all_ok = False
 
     return all_ok
+
+
+# ============================================================
+# SHADOW LOG (Phase 2.3)
+# ============================================================
+
+def send_shadow_log(
+    signals: List[Dict[str, Any]],
+    run_date: str,
+) -> bool:
+    """
+    Send shadow log summary message after daily signals.
+    Shows EMA9 gap, extension, and RS gap per signal for quick daily review.
+    Always sent regardless of signal count (even 1 signal).
+
+    Format:
+      📝 SHADOW LOG — 2026-06-01
+      ──────────────────────────────────────────
+      NVDA  | Close $182.50 → EMA9 $180.20 | gap 1.27% | ext 0.80×ATR | RS −1.2%
+      IBM   | Close $235.10 → EMA9 $231.80 | gap 1.42% | ext 1.10×ATR | RS +0.5%
+      ──────────────────────────────────────────
+      Avg EMA9 gap: 1.35% | Fill likely if gap ≤ 1.5%
+    """
+    if not signals:
+        return False
+
+    sep = "──────────────────────────────────────────"
+    msg = f"📝 *SHADOW LOG — {run_date}*\n"
+    msg += f"`{sep}`\n"
+
+    gaps = []
+    for sig in signals:
+        ticker = sig.get("ticker", "?")
+        shadow = sig.get("_shadow_indicators", {})
+
+        close_price = float(shadow.get("close_price", 0))
+        ema9_price = float(shadow.get("ema9_price", 0))
+        ema9_gap_pct = float(shadow.get("ema9_gap_pct", 0))
+        ema9_ext_atr = float(shadow.get("ema9_ext_atr", 0))
+        rs_gap = float(shadow.get("rs_gap_vs_spy", 0))
+
+        gaps.append(ema9_gap_pct)
+
+        msg += (
+            f"`{ticker:<6}` | "
+            f"Close ${close_price:.2f} → EMA9 ${ema9_price:.2f} | "
+            f"gap {ema9_gap_pct:.2f}% | "
+            f"ext {ema9_ext_atr:.2f}×ATR | "
+            f"RS {rs_gap:+.1f}%\n"
+        )
+
+    msg += f"`{sep}`\n"
+
+    avg_gap = sum(gaps) / len(gaps) if gaps else 0
+    msg += f"Avg EMA9 gap: {avg_gap:.2f}% | Fill likely if gap ≤ 1.5%"
+
+    return _send_message(msg)
 
 
 # ============================================================
@@ -288,9 +392,8 @@ def send_no_signal_day(
 ) -> bool:
     """Send explanation message when no signals qualify."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    no_sig_emoji = config.NO_SIGNAL_EMOJI
 
-    msg = f"{no_sig_emoji} *No Signal — {today}*\n\n"
+    msg = f"{config.NO_SIGNAL_EMOJI} *No Signal — {today}*\n\n"
     msg += _format_macro_header(macro) + "\n\n"
     msg += f"📋 *Reason*\n{reason}\n"
 
@@ -309,49 +412,42 @@ def send_black_swan_crash(
     Type A: Risk-off crash detected.
     Sends alert + defensive trade ideas (if Opus generated any).
     """
-    crash_emoji = config.BLACK_SWAN_CRASH_EMOJI
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    msg = f"{crash_emoji} *BLACK SWAN — TYPE A: CRASH*\n"
+    msg = f"{config.BLACK_SWAN_CRASH_EMOJI} *BLACK SWAN — TYPE A: CRASH*\n"
     msg += f"_{timestamp}_\n\n"
 
-    # Market moves
     msg += "📉 *Market moves*\n"
-    moves = event_summary.get("market_moves", {})
-    for k, v in moves.items():
-        msg += f"• {k}: {v}\n"
+    for k, v in event_summary.get("market_moves", {}).items():
+        msg += f"- {k}: {v}\n"
     msg += "\n"
 
-    # Action
     msg += "⚠️ *Action*\n"
     msg += "HALT new long entries. Wait 1-2 days for stabilization.\n\n"
 
-    # Preferred sectors
     preferred = event_summary.get("preferred_sectors", [])
     if preferred:
         msg += "🛡️ *Defensive sectors to watch*\n"
         for sector in preferred:
-            msg += f"• {sector}\n"
+            msg += f"- {sector}\n"
         msg += "\n"
 
-    # Recent headlines
     headlines = event_summary.get("headlines", [])
     if headlines:
         msg += "📰 *Recent headlines*\n"
         for h in headlines[:5]:
-            msg += f"• {h[:100]}\n"
+            msg += f"- {h[:100]}\n"
         msg += "\n"
 
     success = _send_message(msg)
 
-    # Send trade ideas as separate messages (use full signal format)
     if trade_ideas:
         ideas_header = (
             f"💡 *Defensive watchlist for tomorrow* — {len(trade_ideas)} ideas\n\n"
         )
         for s in trade_ideas:
-            emoji, _ = _conviction_tier(s.get("conviction", 0))
-            ideas_header += f"{emoji} {s.get('ticker')} — {s.get('conviction')}/100\n"
+            sig_emoji, _ = _conviction_tier(s.get("conviction", 0))
+            ideas_header += f"{sig_emoji} {s.get('ticker')} — {s.get('conviction')}/100\n"
         _send_message(ideas_header)
 
         for idea in trade_ideas:
@@ -367,41 +463,34 @@ def send_black_swan_rally(
     Type B: Risk-on rally detected.
     Alert + sector guidance only — no defensive ideas.
     """
-    rally_emoji = config.BLACK_SWAN_RALLY_EMOJI
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    msg = f"{rally_emoji} *BLACK SWAN — TYPE B: RALLY*\n"
+    msg = f"{config.BLACK_SWAN_RALLY_EMOJI} *BLACK SWAN — TYPE B: RALLY*\n"
     msg += f"_{timestamp}_\n\n"
 
-    # Market moves
     msg += "📈 *Market moves*\n"
-    moves = event_summary.get("market_moves", {})
-    for k, v in moves.items():
-        msg += f"• {k}: {v}\n"
+    for k, v in event_summary.get("market_moves", {}).items():
+        msg += f"- {k}: {v}\n"
     msg += "\n"
 
-    # Action
     msg += "⚠️ *Action*\n"
     msg += "Avoid chasing breakouts. Wait for pullback or consolidation.\n\n"
 
-    # Preferred sectors
     preferred = event_summary.get("preferred_sectors", [])
     if preferred:
         msg += "✅ *Preferred sectors*\n"
         msg += ", ".join(preferred) + "\n\n"
 
-    # Skip sectors
     skip = event_summary.get("skip_sectors", [])
     if skip:
         msg += "❌ *Skip sectors*\n"
         msg += ", ".join(skip) + "\n\n"
 
-    # Headlines
     headlines = event_summary.get("headlines", [])
     if headlines:
         msg += "📰 *Recent headlines*\n"
         for h in headlines[:3]:
-            msg += f"• {h[:100]}\n"
+            msg += f"- {h[:100]}\n"
 
     return _send_message(msg)
 
@@ -413,25 +502,21 @@ def send_black_swan_info(
     Type C: Informational alert (RSS keywords + VIX move).
     No action required, just FYI.
     """
-    info_emoji = config.BLACK_SWAN_INFO_EMOJI
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    msg = f"{info_emoji} *BLACK SWAN — TYPE C: NEWS ALERT*\n"
+    msg = f"{config.BLACK_SWAN_INFO_EMOJI} *BLACK SWAN — TYPE C: NEWS ALERT*\n"
     msg += f"_{timestamp}_\n\n"
 
-    # Market moves
     msg += "📊 *Market moves*\n"
-    moves = event_summary.get("market_moves", {})
-    for k, v in moves.items():
-        msg += f"• {k}: {v}\n"
+    for k, v in event_summary.get("market_moves", {}).items():
+        msg += f"- {k}: {v}\n"
     msg += "\n"
 
-    # Headlines
     headlines = event_summary.get("headlines", [])
     if headlines:
         msg += "📰 *Triggered keywords in headlines*\n"
         for h in headlines[:5]:
-            msg += f"• {h[:120]}\n"
+            msg += f"- {h[:120]}\n"
         msg += "\n"
 
     msg += "ℹ️ Informational only. No action required."
@@ -456,18 +541,24 @@ if __name__ == "__main__":
         "tier_1_pass": True,
         "direction": "LONG",
         "setup_type": "Trend continuation + volume surge",
-        "entry": 142.50,
-        "stop_loss": 137.80,
-        "tp1": 152.00,
-        "tp2": 161.50,
-        "rr_ratio": 2.02,
-        "rr_extended": 4.04,
+        "entry": 180.20,        # EMA9 limit
+        "stop_loss": 177.50,
+        "tp1": 185.90,
+        "tp2": 191.60,
+        "rr_ratio": 2.00,
+        "rr_extended": 3.00,
         "position_size_usd": 91.00,
-        "shares": 0.638,
-        "risk_amount_usd": 2.99,
-        "thesis": "NVDA breaking out of 6-week consolidation with strong volume confirmation. AI sector tailwind continues with strong earnings momentum.",
-        "invalidation": ["Close below 137.50", "Volume drying up <0.8x avg"],
-        "max_holding_days": 5,
+        "shares": 0.5049,
+        "risk_amount_usd": 2.70,
+        "thesis": (
+            "NVDA breaking out of 6-week consolidation with strong volume confirmation. "
+            "AI sector tailwind continues with strong earnings momentum."
+        ),
+        "invalidation": [
+            "Close below EMA9 support",
+            "VIX spikes > 25",
+            "Volume dries up < 0.8x avg",
+        ],
         "confluence_display": "3/3 (MACD✓ EMA9✓ EMA21✓)",
         "breakdown": {
             "technical": 26,
@@ -475,6 +566,20 @@ if __name__ == "__main__":
             "macro": 16,
             "news_catalyst": 11,
             "rr_asymmetry": 8,
+        },
+        "_shadow_indicators": {
+            "close_price": 182.50,
+            "ema9_price": 180.20,
+            "ema9_gap_pct": 1.27,
+            "ema9_ext_atr": 0.80,
+            "rs_gap_vs_spy": -1.2,
+            "spy_10d_return": 5.0,
+            "stock_10d_return": 3.8,
+            "confluence_count": 3,
+            "adx": 38.2,
+            "rsi": 61.4,
+            "volume_ratio": 1.85,
+            "entry_close": 182.50,
         },
     }
 
@@ -487,3 +592,7 @@ if __name__ == "__main__":
 
     print("\n=== Mock Signal Format ===")
     print(_format_signal(mock_signal))
+
+    print("\n=== Mock Shadow Log ===")
+    mock_shadow_msg = send_shadow_log([mock_signal], "2026-06-01")
+    print(f"Shadow log sent: {mock_shadow_msg}")
