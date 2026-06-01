@@ -293,7 +293,7 @@ WARNING_EMOJI = "⚠️"
 # LLM CONFIG
 # ============================================================
 LLM_MODEL_FILTER = "claude-haiku-4-5-20251001"   # Stage 1: cheap quality scoring
-LLM_MODEL_DEEP = "claude-opus-4-7"                # Stage 2: deep thesis generation
+LLM_MODEL_DEEP = "claude-opus-4-8"                # Stage 2: deep thesis generation
 
 LLM_MAX_TOKENS_FILTER = 512                       # ~$0.0026 per Haiku call
 LLM_MAX_TOKENS_DEEP = 2048                        # ~$0.05 per Opus call
