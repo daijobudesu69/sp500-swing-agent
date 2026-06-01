@@ -483,8 +483,7 @@ def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
     """
     rates = {
         "claude-haiku-4-5-20251001": (1.0, 5.0),   # Haiku 4.5
-        "claude-opus-4-7": (5.0, 25.0),             # Opus 4.7
-        "claude-opus-4-6": (5.0, 25.0),             # Opus 4.6 (legacy)
+        "claude-opus-4-8": (5.0, 25.0),             # Opus 4.8
         "claude-sonnet-4-6": (3.0, 15.0),           # Sonnet 4.6
     }
     in_rate, out_rate = rates.get(model, (5.0, 25.0))  # Default to Opus pricing
