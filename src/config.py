@@ -36,6 +36,21 @@ CHANGED:
     F7 demoted from hard gate to soft Haiku context
 ADDED:
   - SHADOW_LOG_PATH = "shadow_log.csv"
+
+PHASE 2.3 — F7 LOOKBACK REVIEW (June 2026):
+============================================
+ADDED (shadow-log only — F7 gate logic UNCHANGED, still gates on 10d):
+  - RS_60D_LOOKBACK, RS_126D_LOOKBACK, RS_SKIP_RECENT_DAYS
+    Feed _compute_momentum_rs_gaps() in main.py to log rs_60d_gap /
+    rs_126d_gap to shadow_log.csv alongside the existing 10d gap.
+    Rationale: 10-day RS sits in the short-term reversal zone
+    (Jegadeesh 1990), while batch data showed losers had HIGHER
+    10d RS than winners (loss avg +7.4% vs win avg +2.9%) — the
+    filter may be selecting at the top of relative strength right
+    before mean-reversion. 60d/126d (skip last 21d per Jegadeesh &
+    Titman 1993 / Springer 2022 momentum convention) will be
+    compared against 10d at the next filter review before any
+    gate change is made. Zero pipeline risk — additive context only.
 """
 import os
 from zoneinfo import ZoneInfo
@@ -137,6 +152,17 @@ EMA9_MAX_EXTENSION_ATR = 1.5            # (close - EMA9) / ATR threshold
 # Penalise in Haiku scoring if < -3.5% (sector laggard risk)
 RS_LOOKBACK_DAYS = 10
 RS_MIN_GAP_VS_SPY = -0.035              # stock 10d return - SPY 10d return
+
+# F7 lookback review (June 2026) — SHADOW LOG ONLY, does not gate anything.
+# 10-day RS sits in the short-term reversal zone (Jegadeesh 1990): batch
+# data showed losers had HIGHER 10d RS than winners (+7.4% vs +2.9%),
+# consistent with buying right before mean-reversion. These two windows
+# let us log a momentum-zone alternative (skip last 21d, per Jegadeesh &
+# Titman 1993 / Springer 2022 convention) to compare against the 10d gap
+# at the next filter review before deciding whether to re-point F7.
+RS_60D_LOOKBACK = 60                    # momentum window #1 — shortest valid horizon
+RS_126D_LOOKBACK = 126                  # momentum window #2 — robustness check (~6mo)
+RS_SKIP_RECENT_DAYS = 21                # skip last ~1 month before measuring momentum
 
 
 # ============================================================
