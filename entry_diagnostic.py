@@ -46,11 +46,25 @@ CHANGED:
     collecting them (comparing 10d vs 60d vs 126d predictive power) was
     not actually achievable until this fix.
   - NEW section: print_rs_lookback_comparison() — splits closed trades by
-    each lookback's breach status (10d below RS_MIN_GAP_VS_SPY threshold,
-    60d/126d below 0 as a simple sign-based comparison since no formal
-    threshold has been set for the longer windows yet) and reports win
-    rate / avg R per lookback so the three windows can be compared
-    side by side at the next filter review.
+    each lookback's breach status and reports win rate / avg R per
+    lookback so the three windows can be compared side by side at the
+    next filter review.
+
+HEADER NORMALIZATION FIX — June 2026:
+=======================================
+The Google Sheet (and any CSV exported from it via File > Download) uses
+column headers WITHOUT the leading underscore (e.g. "shadow_date" instead
+of "_shadow_date") — Google Sheets / Sheet column display strips it.
+shadow_log.csv written directly by main.py's _append_shadow_log() DOES
+use the underscore-prefixed form, since that's the actual dict key used
+internally.
+
+Rather than support two parallel naming schemes throughout this entire
+file (error-prone, easy to miss one spot), load_shadow_log() now
+normalizes every row's keys to the underscore-prefixed form immediately
+on read, via _normalize_fieldnames(). Every other function in this file
+is unchanged and only ever sees the canonical "_shadow_*" key names,
+regardless of which naming convention the source CSV used.
 """
 import argparse
 import csv
@@ -75,27 +89,71 @@ LOSS_OUTCOMES = {"SL", "INVALIDATED_LOSS"}
 CLOSED_OUTCOMES = WIN_OUTCOMES | LOSS_OUTCOMES   # everything except FLOAT / blank
 OPEN_OUTCOMES = {"FLOAT"}
 
+# Canonical field list (the underscore-prefixed form every function in
+# this file expects). Used by _normalize_fieldnames() to map a header
+# WITHOUT the leading underscore back to its canonical name.
+_CANONICAL_FIELDS = [
+    "_shadow_date", "_shadow_ticker", "_shadow_close_price", "_shadow_ema9_price",
+    "_shadow_ema9_gap_pct", "_shadow_ema9_ext_atr", "_shadow_atr", "_shadow_atr_pct",
+    "_shadow_rs_gap_vs_spy", "_shadow_spy_10d_return", "_shadow_stock_10d_return",
+    "_shadow_rs_60d_gap", "_shadow_rs_126d_gap", "_shadow_conviction",
+    "_shadow_confluence_count", "_shadow_haiku_score", "_shadow_adx", "_shadow_rsi",
+    "_shadow_volume_ratio", "_shadow_entry_close", "_shadow_entry_ema9",
+    "_shadow_stop", "_shadow_tp1", "_shadow_tp2", "_shadow_rr",
+    "_shadow_ema9_filled", "_shadow_outcome", "_shadow_r_realized", "_shadow_hold_days",
+]
+# Map "shadow_date" -> "_shadow_date", etc. — built once at import time.
+_NO_UNDERSCORE_TO_CANONICAL = {f.lstrip("_"): f for f in _CANONICAL_FIELDS}
+
 
 # ============================================================
 # CSV READER
 # ============================================================
+
+def _normalize_fieldnames(row: Dict[str, str]) -> Dict[str, str]:
+    """
+    Normalize a single row's keys to the canonical "_shadow_*" form,
+    regardless of whether the source CSV used the underscore-prefixed
+    form (main.py's direct CSV write) or the no-underscore form
+    (Google Sheets column headers / a CSV exported from the Sheet).
+
+    Any key not recognised in either form is passed through unchanged
+    (e.g. extra columns someone added manually, like a "Remarks" field
+    from the R Calculator tab if it ever ends up in the same export).
+    """
+    out = {}
+    for key, value in row.items():
+        if key in _CANONICAL_FIELDS:
+            out[key] = value                              # already canonical
+        elif key in _NO_UNDERSCORE_TO_CANONICAL:
+            out[_NO_UNDERSCORE_TO_CANONICAL[key]] = value  # strip-form -> canonical
+        else:
+            out[key] = value                               # unknown column, pass through
+    return out
+
 
 def load_shadow_log(csv_path: str) -> List[Dict[str, Any]]:
     """
     Load shadow_log.csv into a list of dicts.
     Coerces numeric fields. Leaves blanks as empty string.
     Returns empty list if file not found.
+
+    Accepts either header convention transparently (see
+    _normalize_fieldnames() docstring above) — every row is normalized
+    to "_shadow_*" keys before any further processing happens.
     """
     if not os.path.isfile(csv_path):
         print(f"[ERROR] File not found: {csv_path}")
         print("  Run the daily pipeline at least once to generate shadow_log.csv")
+        print("  (or export the Google Sheet 'shadow_log' tab via File > Download > CSV)")
         return []
 
     rows = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append(_coerce_row(row))
+            normalized = _normalize_fieldnames(row)
+            rows.append(_coerce_row(normalized))
 
     return rows
 
@@ -118,21 +176,21 @@ def _coerce_row(row: Dict[str, str]) -> Dict[str, Any]:
     out = dict(row)
 
     for f in float_fields:
-        val = out.get(f, "").strip()
+        val = str(out.get(f, "")).strip()
         try:
             out[f] = float(val) if val != "" else None
         except ValueError:
             out[f] = None
 
     for f in int_fields:
-        val = out.get(f, "").strip()
+        val = str(out.get(f, "")).strip()
         try:
             out[f] = int(val) if val != "" else None
         except ValueError:
             out[f] = None
 
     for f in bool_fields:
-        val = out.get(f, "").strip().lower()
+        val = str(out.get(f, "")).strip().lower()
         if val == "true":
             out[f] = True
         elif val == "false":
@@ -149,7 +207,7 @@ def _coerce_row(row: Dict[str, str]) -> Dict[str, Any]:
 
 def _outcome(row: Dict[str, Any]) -> str:
     """Normalised outcome string, uppercased, stripped. '' if blank."""
-    return row.get("_shadow_outcome", "").strip().upper()
+    return str(row.get("_shadow_outcome", "")).strip().upper()
 
 
 def is_closed(row: Dict[str, Any]) -> bool:
@@ -411,7 +469,7 @@ def print_signal_table(rows: List[Dict[str, Any]]) -> None:
     print(DIVIDER)
 
     for r in rows:
-        date = r.get("_shadow_date", "")[:10]
+        date = str(r.get("_shadow_date", ""))[:10]
         ticker = r.get("_shadow_ticker", "")
         close = r.get("_shadow_close_price")
         ema9 = r.get("_shadow_entry_ema9")
