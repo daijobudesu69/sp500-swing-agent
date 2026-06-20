@@ -30,7 +30,7 @@ PIPELINE FLOW:
   6. Opus deep analysis
   7. Risk manager validation
   8. Send to Telegram
-  9. Shadow log append (CSV + Telegram)
+  9. Shadow log append (CSV + Telegram + Google Sheets)
 
 BLACK SWAN (separate 15-min entry point):
   Type A — Crash:      VIX spike + SPY drop → HALT + defensive ideas via Opus
@@ -59,6 +59,28 @@ ADDED (shadow-log only — NOT a gate, F7 gate logic unchanged):
     10d (current F7) vs 60d vs 126d RS gap against closed-trade outcomes.
     If 60d/126d separates win/loss better than 10d, F7 gets re-pointed.
     Zero pipeline risk — these are additional context fields only.
+
+PHASE 4a REVISION (June 2026):
+================================
+ADDED:
+  - Google Sheets mirror of the shadow log via src/sheets_logger.py.
+    Wired into STAGE 8, runs after the existing CSV append + Telegram
+    shadow log message. Non-blocking — failure here never stops the
+    pipeline or affects signal delivery (same try/except contract as
+    the existing shadow log step).
+  - IMPORTANT: the CSV (shadow_log.csv) remains the source of truth.
+    The Sheet is a parallel mirror for easier manual outcome entry
+    from phone/browser. The two are written independently from two
+    separately-built row dicts — there is no two-way sync. If you
+    edit the manual fields in one, remember to mirror the edit in
+    the other, or pick one as your single working copy going forward.
+  - _shadow_outcome categories (manual field — fill in after a trade closes):
+      SL                  -> stopped out before TP1
+      TP1_TRAIL           -> TP1 hit, 50% locked +2R, remainder trailed to exit
+      TP2                 -> full target hit (+3R)
+      INVALIDATED_LOSS    -> discretionary exit pre-TP1, exit price < entry
+      INVALIDATED_PROFIT  -> discretionary exit pre-TP1, exit price > entry
+      FLOAT               -> still open at time of review (mark-to-market)
 """
 import csv
 import logging
@@ -78,6 +100,7 @@ from src import indicators as ind_mod
 from src import analyst as analyst_mod
 from src import risk_manager as risk_mod
 from src import telegram_sender as tg_mod
+from src import sheets_logger as sheets_mod
 
 # ============================================================
 # LOGGING
@@ -201,17 +224,68 @@ def _compute_momentum_rs_gaps(
 # SHADOW LOG — CSV APPEND
 # ============================================================
 
-def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
+def _build_shadow_rows(signals: List[Dict[str, Any]], run_date: str) -> List[Dict[str, Any]]:
+    """
+    Build the list of shadow-log row dicts (auto fields populated, manual
+    fields left blank) for a batch of approved signals.
+
+    Shared by both the CSV writer (_append_shadow_log) and the Google
+    Sheets mirror (STAGE 8) so there is exactly ONE place that defines
+    what a shadow-log row looks like. Add new fields here only.
+    """
+    rows = []
+    for sig in signals:
+        ind = sig.get("_shadow_indicators", {})
+        rows.append({
+            "_shadow_date": run_date,
+            "_shadow_ticker": sig.get("ticker", ""),
+            "_shadow_close_price": ind.get("close_price", ""),
+            "_shadow_ema9_price": ind.get("ema9_price", ""),
+            "_shadow_ema9_gap_pct": ind.get("ema9_gap_pct", ""),
+            "_shadow_ema9_ext_atr": ind.get("ema9_ext_atr", ""),
+            "_shadow_atr": ind.get("atr", ""),
+            "_shadow_atr_pct": ind.get("atr_pct", ""),
+            "_shadow_rs_gap_vs_spy": ind.get("rs_gap_vs_spy", ""),
+            "_shadow_spy_10d_return": ind.get("spy_10d_return", ""),
+            "_shadow_stock_10d_return": ind.get("stock_10d_return", ""),
+            "_shadow_rs_60d_gap": ind.get("rs_60d_gap", ""),
+            "_shadow_rs_126d_gap": ind.get("rs_126d_gap", ""),
+            "_shadow_conviction": sig.get("conviction", ""),
+            "_shadow_confluence_count": ind.get("confluence_count", ""),
+            "_shadow_haiku_score": sig.get("_haiku_score", ""),
+            "_shadow_adx": ind.get("adx", ""),
+            "_shadow_rsi": ind.get("rsi", ""),
+            "_shadow_volume_ratio": ind.get("volume_ratio", ""),
+            "_shadow_entry_close": ind.get("entry_close", ""),
+            "_shadow_entry_ema9": sig.get("entry", ""),     # Opus sets entry = EMA9
+            "_shadow_stop": sig.get("stop_loss", ""),
+            "_shadow_tp1": sig.get("tp1", ""),
+            "_shadow_tp2": sig.get("tp2", ""),
+            "_shadow_rr": sig.get("rr_ratio", ""),
+            # Manual — blank on write, filled in by hand after trade closes
+            "_shadow_ema9_filled": "",
+            "_shadow_outcome": "",
+            "_shadow_r_realized": "",
+            "_shadow_hold_days": "",
+        })
+    return rows
+
+
+def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> List[Dict[str, Any]]:
     """
     Append auto-logged shadow fields for each approved signal to shadow_log.csv.
     Manual outcome fields are written as empty strings for manual fill-in later.
 
+    Returns the row list that was written, so callers (e.g. the Google
+    Sheets mirror in STAGE 8) can reuse the exact same rows instead of
+    rebuilding them — keeps CSV and Sheet permanently in sync by
+    construction rather than by two parallel copies of the same logic.
+
     Fields written:
       Auto: date, ticker, close_price, ema9_price, ema9_gap_pct, ema9_ext_atr,
             atr, atr_pct, rs_gap_vs_spy, spy_10d_return, stock_10d_return,
-            rs_60d_gap, rs_126d_gap,   <-- NEW (Phase 2.3 F7 review, shadow-only)
-            conviction, confluence_count, haiku_score, adx, rsi, volume_ratio,
-            entry_close, entry_ema9, stop, tp1, tp2, rr
+            rs_60d_gap, rs_126d_gap, conviction, confluence_count, haiku_score,
+            adx, rsi, volume_ratio, entry_close, entry_ema9, stop, tp1, tp2, rr
       Manual (blank): ema9_filled, outcome, r_realized, hold_days
     """
     log_path = getattr(config, "SHADOW_LOG_PATH", "shadow_log.csv")
@@ -229,8 +303,8 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
         "_shadow_rs_gap_vs_spy",
         "_shadow_spy_10d_return",
         "_shadow_stock_10d_return",
-        "_shadow_rs_60d_gap",      # NEW
-        "_shadow_rs_126d_gap",     # NEW
+        "_shadow_rs_60d_gap",
+        "_shadow_rs_126d_gap",
         "_shadow_conviction",
         "_shadow_confluence_count",
         "_shadow_haiku_score",
@@ -250,6 +324,7 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
         "_shadow_hold_days",
     ]
 
+    rows = _build_shadow_rows(signals, run_date)
     file_exists = os.path.isfile(log_path)
 
     try:
@@ -257,47 +332,15 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             if not file_exists:
                 writer.writeheader()
-
-            for sig in signals:
-                ind = sig.get("_shadow_indicators", {})
-                row = {
-                    "_shadow_date": run_date,
-                    "_shadow_ticker": sig.get("ticker", ""),
-                    "_shadow_close_price": ind.get("close_price", ""),
-                    "_shadow_ema9_price": ind.get("ema9_price", ""),
-                    "_shadow_ema9_gap_pct": ind.get("ema9_gap_pct", ""),
-                    "_shadow_ema9_ext_atr": ind.get("ema9_ext_atr", ""),
-                    "_shadow_atr": ind.get("atr", ""),
-                    "_shadow_atr_pct": ind.get("atr_pct", ""),
-                    "_shadow_rs_gap_vs_spy": ind.get("rs_gap_vs_spy", ""),
-                    "_shadow_spy_10d_return": ind.get("spy_10d_return", ""),
-                    "_shadow_stock_10d_return": ind.get("stock_10d_return", ""),
-                    "_shadow_rs_60d_gap": ind.get("rs_60d_gap", ""),    # NEW
-                    "_shadow_rs_126d_gap": ind.get("rs_126d_gap", ""), # NEW
-                    "_shadow_conviction": sig.get("conviction", ""),
-                    "_shadow_confluence_count": ind.get("confluence_count", ""),
-                    "_shadow_haiku_score": sig.get("_haiku_score", ""),
-                    "_shadow_adx": ind.get("adx", ""),
-                    "_shadow_rsi": ind.get("rsi", ""),
-                    "_shadow_volume_ratio": ind.get("volume_ratio", ""),
-                    "_shadow_entry_close": ind.get("entry_close", ""),
-                    "_shadow_entry_ema9": sig.get("entry", ""),     # Opus sets entry = EMA9
-                    "_shadow_stop": sig.get("stop_loss", ""),
-                    "_shadow_tp1": sig.get("tp1", ""),
-                    "_shadow_tp2": sig.get("tp2", ""),
-                    "_shadow_rr": sig.get("rr_ratio", ""),
-                    # Manual — blank on write
-                    "_shadow_ema9_filled": "",
-                    "_shadow_outcome": "",
-                    "_shadow_r_realized": "",
-                    "_shadow_hold_days": "",
-                }
+            for row in rows:
                 writer.writerow(row)
 
-        logger.info(f"Shadow log appended: {len(signals)} row(s) → {log_path}")
+        logger.info(f"Shadow log appended: {len(rows)} row(s) → {log_path}")
 
     except Exception as e:
         logger.error(f"Shadow log append failed: {e}")
+
+    return rows
 
 
 # ============================================================
@@ -705,16 +748,36 @@ def run_daily_signals() -> Dict[str, Any]:
         result["status"] = "success" if sent_ok else "telegram_failed"
 
         # --------------------------------------------------------
-        # STAGE 8: Shadow log append (Phase 2.3)
-        # Runs after Telegram send — non-blocking, never gates the pipeline
-        # Google Sheets mirror (Phase 4a) intentionally NOT wired in yet —
-        # added once the target Sheet + secrets are set up.
+        # STAGE 8: Shadow log append (Phase 2.3) + Google Sheets mirror (Phase 4a)
+        # Runs after Telegram send — non-blocking, never gates the pipeline.
+        #
+        # _append_shadow_log() writes shadow_log.csv AND returns the exact
+        # row list it wrote. We pass that SAME list to sheets_mod so the
+        # CSV and the Sheet are always built from one row-construction
+        # path (_build_shadow_rows) instead of two parallel copies of the
+        # same field-mapping logic drifting apart over time.
+        #
+        # CSV remains the source of truth. The Sheet is a parallel mirror
+        # for easier manual outcome entry from phone/browser — there is
+        # still no two-way sync between them once you start hand-editing
+        # the manual fields, so pick one as your "working copy" for edits
+        # and treat the other as read-only reference, or remember to
+        # mirror edits both ways.
         # --------------------------------------------------------
+        shadow_rows: List[Dict[str, Any]] = []
         try:
-            _append_shadow_log(approved, run_date)
+            shadow_rows = _append_shadow_log(approved, run_date)
             tg_mod.send_shadow_log(approved, run_date)
         except Exception as shadow_err:
             logger.warning(f"Shadow log step failed (non-critical): {shadow_err}")
+
+        try:
+            if shadow_rows:
+                sheets_mod.append_shadow_rows(shadow_rows)
+            else:
+                logger.warning("Skipping Google Sheets mirror — no shadow rows available")
+        except Exception as sheets_err:
+            logger.warning(f"Google Sheets mirror failed (non-critical): {sheets_err}")
 
         total = round(time.time() - start_time, 2)
         logger.info(
