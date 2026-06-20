@@ -17,7 +17,6 @@ Setup (one-time):
        GSHEET_TAB      = (optional) worksheet/tab name, default "shadow_log"
   5. requirements.txt: add  gspread>=6.0.0  and  google-auth>=2.30.0
 """
-
 import os
 import json
 
@@ -30,13 +29,40 @@ except Exception:                       # libs not installed -> degrade silently
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Must match shadow_log.csv column order. rs_60d_gap / rs_126d_gap added for F7 test.
+# Must match the exact keys written by _append_shadow_log() in main.py
+# (same dicts are passed to append_shadow_rows() — no renaming/adapter layer,
+# so this list IS the single source of truth for shadow_log.csv column order
+# AND the Sheet column order).
 HEADER = [
-    "date", "ticker", "close_price", "ema9_price", "ema9_gap_pct", "ema9_ext_atr", "atr",
-    "rs_gap_vs_spy_pct", "spy_10d_return", "stock_10d_return", "rs_60d_gap", "rs_126d_gap",
-    "conviction", "confluence_count", "haiku_score", "adx", "rsi", "vol_ratio",
-    "entry_close", "entry_ema9", "stop", "tp1", "tp2", "rr",
-    "_shadow_ema9_filled", "_shadow_outcome", "_shadow_r_realized", "_shadow_hold_days",
+    "_shadow_date",
+    "_shadow_ticker",
+    "_shadow_close_price",
+    "_shadow_ema9_price",
+    "_shadow_ema9_gap_pct",
+    "_shadow_ema9_ext_atr",
+    "_shadow_atr",
+    "_shadow_atr_pct",
+    "_shadow_rs_gap_vs_spy",
+    "_shadow_spy_10d_return",
+    "_shadow_stock_10d_return",
+    "_shadow_rs_60d_gap",
+    "_shadow_rs_126d_gap",
+    "_shadow_conviction",
+    "_shadow_confluence_count",
+    "_shadow_haiku_score",
+    "_shadow_adx",
+    "_shadow_rsi",
+    "_shadow_volume_ratio",
+    "_shadow_entry_close",
+    "_shadow_entry_ema9",
+    "_shadow_stop",
+    "_shadow_tp1",
+    "_shadow_tp2",
+    "_shadow_rr",
+    "_shadow_ema9_filled",
+    "_shadow_outcome",
+    "_shadow_r_realized",
+    "_shadow_hold_days",
 ]
 
 
@@ -60,7 +86,8 @@ def _worksheet():
 
 def append_shadow_rows(rows):
     """
-    rows: list[dict] keyed by HEADER (the same dicts written to shadow_log.csv).
+    rows: list[dict] keyed by HEADER (the SAME dicts written to shadow_log.csv
+    by _append_shadow_log() in main.py — pass them through unmodified).
     Returns True on success, False on any failure (never raises).
     """
     try:
