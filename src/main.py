@@ -46,6 +46,19 @@ ADDED:
     Writes auto-logged fields to shadow_log.csv (config.SHADOW_LOG_PATH).
     Manual outcome fields (_shadow_ema9_filled, _shadow_outcome, etc.)
     are left blank for manual fill-in after trade closes.
+
+PHASE 2.3 — F7 LOOKBACK REVIEW (June 2026):
+============================================
+ADDED (shadow-log only — NOT a gate, F7 gate logic unchanged):
+  - rs_60d_gap and rs_126d_gap computed alongside the existing 10d RS gap.
+    Both use the "skip last 21 trading days" momentum convention
+    (Jegadeesh & Titman 1993 / Springer 2022 momentum-reversal literature)
+    to avoid contaminating the momentum window with short-term reversal noise.
+    Window: t-(N+21) -> t-21, where N = 60 or 126.
+  - Purpose: at the next filter review, compare predictive power of
+    10d (current F7) vs 60d vs 126d RS gap against closed-trade outcomes.
+    If 60d/126d separates win/loss better than 10d, F7 gets re-pointed.
+    Zero pipeline risk — these are additional context fields only.
 """
 import csv
 import logging
@@ -127,6 +140,64 @@ def assess_macro_regime(macro_ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
+# RS GAP HELPER — Phase 2.3 F7 lookback review (shadow-only)
+# ============================================================
+
+def _compute_return_pct(close_series: pd.Series, lookback_days: int, skip_recent_days: int = 0) -> Optional[float]:
+    """
+    Generic % return over a lookback window, optionally skipping the most
+    recent N trading days (momentum convention — avoids short-term reversal
+    contamination per Jegadeesh & Titman 1993 / Springer 2022).
+
+    skip_recent_days=0  -> return from t-lookback to t       (used for F7 10d, unchanged)
+    skip_recent_days=21 -> return from t-(lookback+21) to t-21 (used for 60d/126d shadow fields)
+
+    Returns None if insufficient history (caller defaults to 0.0 / skips field).
+    """
+    end_idx = -(skip_recent_days + 1) if skip_recent_days > 0 else -1
+    start_idx = -(lookback_days + skip_recent_days + 1)
+
+    if len(close_series) < abs(start_idx):
+        return None
+
+    end_price = float(close_series.iloc[end_idx])
+    start_price = float(close_series.iloc[start_idx])
+    if start_price == 0:
+        return None
+    return ((end_price - start_price) / start_price) * 100
+
+
+def _compute_momentum_rs_gaps(
+    stock_close: pd.Series,
+    spy_close: pd.Series,
+) -> Dict[str, Optional[float]]:
+    """
+    Phase 2.3 F7 review — shadow-only momentum RS gaps.
+    Computes 60d and 126d RS gap (stock - SPY), each skipping the most
+    recent 21 trading days. NOT used for gating — F7 gate still runs on
+    the existing 10d gap untouched in run_mandatory_screener().
+
+    Returns dict with rs_60d_gap / rs_126d_gap, values may be None if
+    insufficient price history (e.g. recent IPO).
+    """
+    skip = getattr(config, "RS_SKIP_RECENT_DAYS", 21)
+    lookbacks = {
+        "rs_60d_gap": getattr(config, "RS_60D_LOOKBACK", 60),
+        "rs_126d_gap": getattr(config, "RS_126D_LOOKBACK", 126),
+    }
+
+    out: Dict[str, Optional[float]] = {}
+    for field, lb in lookbacks.items():
+        stock_ret = _compute_return_pct(stock_close, lb, skip_recent_days=skip)
+        spy_ret = _compute_return_pct(spy_close, lb, skip_recent_days=skip)
+        if stock_ret is None or spy_ret is None:
+            out[field] = None
+        else:
+            out[field] = round(stock_ret - spy_ret, 2)
+    return out
+
+
+# ============================================================
 # SHADOW LOG — CSV APPEND
 # ============================================================
 
@@ -138,6 +209,7 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
     Fields written:
       Auto: date, ticker, close_price, ema9_price, ema9_gap_pct, ema9_ext_atr,
             atr, atr_pct, rs_gap_vs_spy, spy_10d_return, stock_10d_return,
+            rs_60d_gap, rs_126d_gap,   <-- NEW (Phase 2.3 F7 review, shadow-only)
             conviction, confluence_count, haiku_score, adx, rsi, volume_ratio,
             entry_close, entry_ema9, stop, tp1, tp2, rr
       Manual (blank): ema9_filled, outcome, r_realized, hold_days
@@ -157,6 +229,8 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
         "_shadow_rs_gap_vs_spy",
         "_shadow_spy_10d_return",
         "_shadow_stock_10d_return",
+        "_shadow_rs_60d_gap",      # NEW
+        "_shadow_rs_126d_gap",     # NEW
         "_shadow_conviction",
         "_shadow_confluence_count",
         "_shadow_haiku_score",
@@ -198,6 +272,8 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> None:
                     "_shadow_rs_gap_vs_spy": ind.get("rs_gap_vs_spy", ""),
                     "_shadow_spy_10d_return": ind.get("spy_10d_return", ""),
                     "_shadow_stock_10d_return": ind.get("stock_10d_return", ""),
+                    "_shadow_rs_60d_gap": ind.get("rs_60d_gap", ""),    # NEW
+                    "_shadow_rs_126d_gap": ind.get("rs_126d_gap", ""), # NEW
                     "_shadow_conviction": sig.get("conviction", ""),
                     "_shadow_confluence_count": ind.get("confluence_count", ""),
                     "_shadow_haiku_score": sig.get("_haiku_score", ""),
@@ -248,7 +324,11 @@ def run_mandatory_screener(
       candidate and stores it in the candidate dict + brief_data for Haiku context.
       SPY is fetched ONCE before the loop (not per ticker).
 
-    Returns list of candidates with brief_data attached.
+    Phase 2.3 — F7 lookback review (NOT a hard gate, shadow-only):
+      Also computes rs_60d_gap and rs_126d_gap (skip-21d momentum convention)
+      for the SAME candidates that already passed F1-F5, using the SAME
+      SPY series fetched once above. These are stored alongside the 10d gap
+      purely for the upcoming filter review — F7 gating logic is untouched.
     """
     candidates = []
     errors = 0
@@ -257,26 +337,35 @@ def run_mandatory_screener(
 
     # --------------------------------------------------------
     # Phase 2.3: Fetch SPY 10d return ONCE before the loop (soft F7 context)
+    # Also fetch the longer SPY close series here so the 60d/126d helper
+    # below doesn't need a second SPY call.
     # --------------------------------------------------------
     spy_10d_return = 0.0
+    spy_close_series = None
     try:
-        spy_df = data_mod.fetch_ohlcv("SPY", period="3mo", interval="1d")
+        spy_df = data_mod.fetch_ohlcv("SPY", period="1y", interval="1d")  # widened from 3mo to cover 126d+21d skip
         rs_lookback = getattr(config, "RS_LOOKBACK_DAYS", 10)
-        if spy_df is not None and len(spy_df) >= rs_lookback + 1:
-            spy_close = spy_df["Close"]
-            spy_end = float(spy_close.iloc[-1])
-            spy_start = float(spy_close.iloc[-(rs_lookback + 1)])
-            spy_10d_return = ((spy_end - spy_start) / spy_start) * 100
-            logger.info(f"SPY {rs_lookback}d return: {spy_10d_return:+.2f}%")
+        if spy_df is not None:
+            spy_close_series = spy_df["Close"]
+            if len(spy_close_series) >= rs_lookback + 1:
+                spy_end = float(spy_close_series.iloc[-1])
+                spy_start = float(spy_close_series.iloc[-(rs_lookback + 1)])
+                spy_10d_return = ((spy_end - spy_start) / spy_start) * 100
+                logger.info(f"SPY {rs_lookback}d return: {spy_10d_return:+.2f}%")
+            else:
+                logger.warning("SPY data insufficient for 10d RS gap — defaulting to 0.0%")
         else:
-            logger.warning("SPY data insufficient for RS gap — defaulting to 0.0%")
+            logger.warning("SPY fetch returned None — RS gaps will default/skip")
     except Exception as e:
         logger.warning(f"SPY fetch for RS gap failed: {e} — defaulting to 0.0%")
 
     for i, (_, row) in enumerate(universe_df.iterrows()):
         ticker = row["ticker"]
         try:
-            df = data_mod.fetch_ohlcv(ticker, period="6mo", interval="1d")
+            # Widened from 6mo to 1y so rs_126d_gap (needs ~147 trading days
+            # of history: 126 + 21 skip) has enough bars. F1-F5 indicators
+            # are unaffected — they only look at the tail of this series.
+            df = data_mod.fetch_ohlcv(ticker, period="1y", interval="1d")
             if df is None:
                 continue
 
@@ -291,7 +380,7 @@ def run_mandatory_screener(
 
             if brief.get("all_mandatory_pass"):
                 # ------------------------------------------------
-                # Phase 2.3: Compute soft F7 — RS gap vs SPY
+                # Phase 2.3: Compute soft F7 — RS gap vs SPY (10d, unchanged)
                 # NOT a gate. Stored for Haiku penalisation context.
                 # ------------------------------------------------
                 rs_gap_vs_spy_pct = 0.0
@@ -305,12 +394,32 @@ def run_mandatory_screener(
                         stock_10d_return = ((stock_end - stock_start) / stock_start) * 100
                         rs_gap_vs_spy_pct = stock_10d_return - spy_10d_return
                 except Exception as rs_err:
-                    logger.debug(f"RS gap compute failed for {ticker}: {rs_err}")
+                    logger.debug(f"RS gap (10d) compute failed for {ticker}: {rs_err}")
 
-                # Inject into brief_data so Haiku receives it
+                # Inject into brief_data so Haiku receives it (unchanged)
                 brief["rs_gap_vs_spy_pct"] = round(rs_gap_vs_spy_pct, 2)
                 brief["stock_10d_return"] = round(stock_10d_return, 2)
                 brief["spy_10d_return"] = round(spy_10d_return, 2)
+
+                # ------------------------------------------------
+                # Phase 2.3 F7 review: 60d / 126d RS gaps — SHADOW ONLY.
+                # Not passed to Haiku, not gated. Logged for the F7
+                # lookback comparison at the next filter review.
+                # ------------------------------------------------
+                if spy_close_series is not None:
+                    try:
+                        momentum_gaps = _compute_momentum_rs_gaps(
+                            stock_close=df["Close"],
+                            spy_close=spy_close_series,
+                        )
+                    except Exception as mom_err:
+                        logger.debug(f"Momentum RS gap compute failed for {ticker}: {mom_err}")
+                        momentum_gaps = {"rs_60d_gap": None, "rs_126d_gap": None}
+                else:
+                    momentum_gaps = {"rs_60d_gap": None, "rs_126d_gap": None}
+
+                brief["rs_60d_gap"] = momentum_gaps.get("rs_60d_gap")
+                brief["rs_126d_gap"] = momentum_gaps.get("rs_126d_gap")
 
                 candidates.append({
                     "ticker": ticker,
@@ -598,6 +707,8 @@ def run_daily_signals() -> Dict[str, Any]:
         # --------------------------------------------------------
         # STAGE 8: Shadow log append (Phase 2.3)
         # Runs after Telegram send — non-blocking, never gates the pipeline
+        # Google Sheets mirror (Phase 4a) intentionally NOT wired in yet —
+        # added once the target Sheet + secrets are set up.
         # --------------------------------------------------------
         try:
             _append_shadow_log(approved, run_date)
