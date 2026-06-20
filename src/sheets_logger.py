@@ -16,6 +16,21 @@ Setup (one-time):
        GSHEET_ID       = the sheet id from the URL (.../d/<THIS_PART>/edit)
        GSHEET_TAB      = (optional) worksheet/tab name, default "shadow_log"
   5. requirements.txt: add  gspread>=6.0.0  and  google-auth>=2.30.0
+
+HEADER ROBUSTNESS FIX (June 2026):
+====================================
+The original header-write check was `if not ws.get_all_values()`, which only
+writes the header when the sheet is COMPLETELY empty. This silently failed
+once: data was written to a tab whose row 1 was not actually empty (e.g. a
+stray formatted cell), so the header was permanently skipped and every
+auto-logged field appeared to be in the wrong place with no labels.
+
+Fixed by checking row 1's actual contents against HEADER, not just
+"does anything exist in the sheet":
+  - Row 1 is empty / sheet has no rows at all  -> append HEADER as row 1
+  - Row 1 exists but does NOT match HEADER      -> INSERT a new row 1 with
+    HEADER, pushing existing data down (never overwrites existing rows)
+  - Row 1 already matches HEADER                -> do nothing
 """
 import os
 import json
@@ -84,6 +99,34 @@ def _worksheet():
         return sh.add_worksheet(title=tab, rows=1000, cols=len(HEADER))
 
 
+def _ensure_header(ws) -> None:
+    """
+    Make sure row 1 of the worksheet is exactly HEADER.
+
+    Checks row 1's actual contents (not "is the sheet empty") so this is
+    robust to: a brand-new empty tab, a tab whose row 1 already has stray
+    formatting/whitespace, or a tab that was reset/cleared after rows were
+    already written. Never overwrites existing data rows — if row 1 isn't
+    HEADER, a new row is INSERTED above whatever is already there.
+    """
+    try:
+        current_row1 = ws.row_values(1)
+    except Exception:
+        current_row1 = []
+
+    if current_row1 == HEADER:
+        return  # already correct, nothing to do
+
+    if not current_row1:
+        # Sheet (or row 1) is genuinely empty — safe to append directly.
+        ws.append_row(HEADER, value_input_option="USER_ENTERED")
+        return
+
+    # Row 1 exists but doesn't match HEADER — insert a fresh row 1 above
+    # it so existing data (whatever it is) shifts down and is preserved.
+    ws.insert_row(HEADER, index=1, value_input_option="USER_ENTERED")
+
+
 def append_shadow_rows(rows):
     """
     rows: list[dict] keyed by HEADER (the SAME dicts written to shadow_log.csv
@@ -95,8 +138,9 @@ def append_shadow_rows(rows):
         if ws is None:
             print("[sheets_logger] not configured (missing libs/secrets) — skipped.")
             return False
-        if not ws.get_all_values():                      # write header once
-            ws.append_row(HEADER, value_input_option="USER_ENTERED")
+
+        _ensure_header(ws)
+
         payload = [[r.get(c, "") for c in HEADER] for r in rows]
         ws.append_rows(payload, value_input_option="USER_ENTERED")
         print(f"[sheets_logger] appended {len(payload)} row(s) to Google Sheet.")
