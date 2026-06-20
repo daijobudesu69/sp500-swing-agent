@@ -39,6 +39,20 @@ OPUS CHANGES:
   - Entry = ema_9 value from brief_data (already in prompt data)
   - Stop / TP1 / TP2 all computed from EMA9 entry
   - Shadow fields added to Opus output dict (_shadow_indicators)
+
+PHASE 2.3 — F7 LOOKBACK REVIEW BUGFIX (June 2026):
+====================================================
+FIXED:
+  - _shadow_indicators in opus_deep_analysis() was missing rs_60d_gap and
+    rs_126d_gap. These fields were added to brief_data in main.py's
+    run_mandatory_screener() (F7 lookback review) but the manual field
+    list here was never updated to carry them through, so every shadow
+    log row (CSV + Google Sheet) silently wrote blank values for both
+    columns despite the upstream computation working correctly.
+  - IMPORTANT — _shadow_indicators is a hand-picked subset of `indicators`,
+    NOT a full passthrough. Any new field added to brief_data in main.py
+    that needs to reach the shadow log MUST be added explicitly to the
+    dict below, or it will silently be dropped at this exact point.
 """
 import json
 import logging
@@ -332,6 +346,15 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
     Full thesis generation for a strong candidate.
     Input: comprehensive data from data_fetcher + indicators.
     Output: full trade signal JSON + _shadow_indicators dict for logging.
+
+    NOTE — _shadow_indicators below is a hand-picked subset of the
+    `indicators` dict (i.e. brief_data from main.py), not a full
+    passthrough. Any field added upstream in main.py's brief_data that
+    needs to show up in the shadow log (CSV or Google Sheet) MUST be
+    added explicitly here too, or it will silently write blank in every
+    downstream log. This already bit us once (rs_60d_gap / rs_126d_gap
+    from the F7 lookback review were computed correctly upstream but
+    missing here, so every shadow row had those two columns blank).
     """
     client = get_client()
     user_prompt = _build_deep_analysis_prompt(ticker, full_data)
@@ -357,7 +380,8 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
         # --------------------------------------------------------
         # Phase 2.3: Attach shadow indicator snapshot for logging
         # Carries indicator values at signal time into the signal dict
-        # so _append_shadow_log() can read them without re-fetching data.
+        # so _append_shadow_log() / sheets_logger can read them without
+        # re-fetching data.
         # --------------------------------------------------------
         ind = full_data.get("indicators", {})
         parsed["_shadow_indicators"] = {
@@ -370,6 +394,8 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
             "rs_gap_vs_spy": ind.get("rs_gap_vs_spy_pct", ""),
             "spy_10d_return": ind.get("spy_10d_return", ""),
             "stock_10d_return": ind.get("stock_10d_return", ""),
+            "rs_60d_gap": ind.get("rs_60d_gap", ""),      # FIX (F7 review) — was missing
+            "rs_126d_gap": ind.get("rs_126d_gap", ""),    # FIX (F7 review) — was missing
             "confluence_count": ind.get("confluence_count", ""),
             "adx": ind.get("adx_14", ""),
             "rsi": ind.get("rsi_14", ""),
