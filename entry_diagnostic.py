@@ -6,6 +6,7 @@ Reads shadow_log.csv and produces a review table covering:
   - Entry improvement: EMA9 entry vs close entry in R terms
   - MAE distribution for closed trades
   - F6/F7 soft warning vs outcome correlation
+  - F7 lookback comparison: 10d vs 60d vs 126d RS gap predictive power
   - Win rate by fill status
 
 USAGE:
@@ -16,11 +17,40 @@ USAGE:
 
 MANUAL FIELDS REQUIRED (fill in shadow_log.csv after each trade closes):
   _shadow_ema9_filled   True / False
-  _shadow_outcome       SL / TP1 / TP2 / FLOAT
-  _shadow_r_realized    float (e.g. -1.0, 3.0, 0.53)
+  _shadow_outcome       SL / TP1_TRAIL / TP2 / INVALIDATED_LOSS /
+                         INVALIDATED_PROFIT / FLOAT
+  _shadow_r_realized    float (e.g. -1.0, 3.0, 0.53, 2.67) — see the
+                         "R Calculator" sheet tab for the formula per category
   _shadow_hold_days     int
 
 Phase 2.3 — June 2026
+Phase 2.3 — F7 LOOKBACK REVIEW REWRITE — June 2026
+====================================================
+CHANGED:
+  - Outcome categories updated from the old 4-state set (SL/TP1/TP2/FLOAT)
+    to the 6-state set actually used in the shadow log going forward:
+      SL                  -> loss, closed
+      TP1_TRAIL           -> win,  closed (TP1 hit, 50% locked +2R, rest trailed)
+      TP2                 -> win,  closed (full target)
+      INVALIDATED_LOSS     -> loss, closed (discretionary exit, exit < entry)
+      INVALIDATED_PROFIT   -> win,  closed (discretionary exit, exit > entry)
+      FLOAT               -> still open, NOT closed
+    The old script only recognised SL/TP1/TP2/FLOAT, which silently
+    excluded TP1_TRAIL and both INVALIDATED_* rows from every closed-trade
+    calculation (win rate, expectancy, F6/F7 breach analysis) even though
+    they represent real, closed, R-valued trades. This was a correctness
+    bug, not just a missing feature — fixed here.
+  - _shadow_rs_60d_gap and _shadow_rs_126d_gap added to the numeric
+    coercion list. These existed in the CSV/Sheet schema since the F7
+    review but were never read by this script — the entire point of
+    collecting them (comparing 10d vs 60d vs 126d predictive power) was
+    not actually achievable until this fix.
+  - NEW section: print_rs_lookback_comparison() — splits closed trades by
+    each lookback's breach status (10d below RS_MIN_GAP_VS_SPY threshold,
+    60d/126d below 0 as a simple sign-based comparison since no formal
+    threshold has been set for the longer windows yet) and reports win
+    rate / avg R per lookback so the three windows can be compared
+    side by side at the next filter review.
 """
 import argparse
 import csv
@@ -36,8 +66,14 @@ from typing import Any, Dict, List, Optional
 DEFAULT_CSV_PATH = "shadow_log.csv"
 EMA9_FILL_GAP_THRESHOLD = 1.5      # % — fills likely if gap <= this
 F6_ATR_THRESHOLD = 1.5             # extension threshold in ATR units
-F7_RS_THRESHOLD = -3.5             # RS gap threshold in %
+F7_RS_THRESHOLD = -3.5             # RS gap threshold in % (10d, current hard config value)
 DIVIDER = "─" * 72
+
+# Outcome category classification (Phase 2.3 F7 review — 6 states)
+WIN_OUTCOMES = {"TP1_TRAIL", "TP2", "INVALIDATED_PROFIT"}
+LOSS_OUTCOMES = {"SL", "INVALIDATED_LOSS"}
+CLOSED_OUTCOMES = WIN_OUTCOMES | LOSS_OUTCOMES   # everything except FLOAT / blank
+OPEN_OUTCOMES = {"FLOAT"}
 
 
 # ============================================================
@@ -70,6 +106,7 @@ def _coerce_row(row: Dict[str, str]) -> Dict[str, Any]:
         "_shadow_close_price", "_shadow_ema9_price", "_shadow_ema9_gap_pct",
         "_shadow_ema9_ext_atr", "_shadow_atr", "_shadow_atr_pct",
         "_shadow_rs_gap_vs_spy", "_shadow_spy_10d_return", "_shadow_stock_10d_return",
+        "_shadow_rs_60d_gap", "_shadow_rs_126d_gap",   # ADDED — F7 lookback review
         "_shadow_conviction", "_shadow_haiku_score", "_shadow_adx",
         "_shadow_rsi", "_shadow_volume_ratio", "_shadow_entry_close",
         "_shadow_entry_ema9", "_shadow_stop", "_shadow_tp1", "_shadow_tp2",
@@ -107,15 +144,37 @@ def _coerce_row(row: Dict[str, str]) -> Dict[str, Any]:
 
 
 # ============================================================
+# OUTCOME CLASSIFICATION HELPERS
+# ============================================================
+
+def _outcome(row: Dict[str, Any]) -> str:
+    """Normalised outcome string, uppercased, stripped. '' if blank."""
+    return row.get("_shadow_outcome", "").strip().upper()
+
+
+def is_closed(row: Dict[str, Any]) -> bool:
+    return _outcome(row) in CLOSED_OUTCOMES
+
+
+def is_win(row: Dict[str, Any]) -> bool:
+    return _outcome(row) in WIN_OUTCOMES
+
+
+def is_loss(row: Dict[str, Any]) -> bool:
+    return _outcome(row) in LOSS_OUTCOMES
+
+
+# ============================================================
 # FILTERS
 # ============================================================
 
 def get_closed(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rows where _shadow_outcome is SL / TP1 / TP2 (not FLOAT or blank)."""
-    return [
-        r for r in rows
-        if r.get("_shadow_outcome", "").strip().upper() in ("SL", "TP1", "TP2")
-    ]
+    """
+    Rows whose outcome is one of the 6 known closed categories:
+    SL, TP1_TRAIL, TP2, INVALIDATED_LOSS, INVALIDATED_PROFIT.
+    Excludes FLOAT and blank/unrecognised outcomes.
+    """
+    return [r for r in rows if is_closed(r)]
 
 
 def get_filled(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -196,12 +255,17 @@ def analyse_entry_improvement(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def analyse_outcomes(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Win rate and expectancy on closed trades."""
+    """
+    Win rate and expectancy on closed trades.
+    A trade counts as a win if its outcome is in WIN_OUTCOMES
+    (TP1_TRAIL, TP2, INVALIDATED_PROFIT) and a loss if in LOSS_OUTCOMES
+    (SL, INVALIDATED_LOSS). FLOAT is excluded upstream by get_closed().
+    """
     if not closed:
         return {"n": 0}
 
-    wins = [r for r in closed if r.get("_shadow_outcome", "").upper() in ("TP1", "TP2")]
-    losses = [r for r in closed if r.get("_shadow_outcome", "").upper() == "SL"]
+    wins = [r for r in closed if is_win(r)]
+    losses = [r for r in closed if is_loss(r)]
 
     r_values = [r["_shadow_r_realized"] for r in closed if r.get("_shadow_r_realized") is not None]
     expectancy = (sum(r_values) / len(r_values)) if r_values else None
@@ -216,9 +280,27 @@ def analyse_outcomes(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def analyse_outcome_breakdown(closed: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Per-category breakdown across all 6 outcome states (closed only).
+    Useful to see e.g. how much of the win bucket is TP1_TRAIL vs TP2
+    vs INVALIDATED_PROFIT, rather than just a flat win/loss number.
+    """
+    categories = ["SL", "TP1_TRAIL", "TP2", "INVALIDATED_LOSS", "INVALIDATED_PROFIT"]
+    out = {}
+    for cat in categories:
+        cat_rows = [r for r in closed if _outcome(r) == cat]
+        r_vals = [r["_shadow_r_realized"] for r in cat_rows if r.get("_shadow_r_realized") is not None]
+        out[cat] = {
+            "n": len(cat_rows),
+            "avg_r": (sum(r_vals) / len(r_vals)) if r_vals else None,
+        }
+    return out
+
+
 def analyse_f6_f7_vs_outcome(rows_with_outcome: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Split outcomes by F6 (EMA9 extension) and F7 (RS gap) breach status.
+    Split outcomes by F6 (EMA9 extension) and F7 10d (RS gap) breach status.
     Helps validate whether soft warnings have predictive value.
     """
     f6_breached = [r for r in rows_with_outcome
@@ -243,12 +325,43 @@ def analyse_f6_f7_vs_outcome(rows_with_outcome: List[Dict[str, Any]]) -> Dict[st
     }
 
 
+def analyse_rs_lookback_comparison(rows_with_outcome: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    NEW (F7 lookback review) — compares predictive power of the 10d
+    (current F7 gate), 60d, and 126d RS gaps against closed-trade outcomes.
+
+    No formal hard threshold exists yet for the 60d/126d windows (they
+    were added as shadow-only context, not gates), so this uses a simple
+    sign split — RS gap negative (underperforming SPY) vs non-negative —
+    as a first-pass comparison. This is intentionally simple: the goal
+    at this stage is just to see whether ANY of the three windows shows
+    a meaningfully different win rate between its two groups. Whichever
+    window shows the clearest separation is the one worth formalising
+    into a real threshold at the next filter review.
+    """
+    def _split_by_sign(field: str) -> Dict[str, Any]:
+        neg = [r for r in rows_with_outcome
+               if r.get(field) is not None and r[field] < 0]
+        nonneg = [r for r in rows_with_outcome
+                  if r.get(field) is not None and r[field] >= 0]
+        return {
+            "negative": _outcome_summary(neg),
+            "non_negative": _outcome_summary(nonneg),
+        }
+
+    return {
+        "rs_10d": _split_by_sign("_shadow_rs_gap_vs_spy"),
+        "rs_60d": _split_by_sign("_shadow_rs_60d_gap"),
+        "rs_126d": _split_by_sign("_shadow_rs_126d_gap"),
+    }
+
+
 def _outcome_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Compact win rate + avg R for a subset of rows."""
     if not rows:
-        return {"n": 0, "win_rate_pct": None, "avg_r": None}
+        return {"n": 0, "closed_n": 0, "win_rate_pct": None, "avg_r": None}
     closed = get_closed(rows)
-    wins = [r for r in closed if r.get("_shadow_outcome", "").upper() in ("TP1", "TP2")]
+    wins = [r for r in closed if is_win(r)]
     r_vals = [r["_shadow_r_realized"] for r in rows if r.get("_shadow_r_realized") is not None]
     return {
         "n": len(rows),
@@ -293,8 +406,8 @@ def _n(val: Optional[int]) -> str:
 def print_signal_table(rows: List[Dict[str, Any]]) -> None:
     """Print all rows as a compact review table."""
     print(f"\n{'DATE':<12} {'TICKER':<7} {'CLOSE':>8} {'EMA9':>8} "
-          f"{'GAP%':>6} {'EXT':>6} {'RS':>7} "
-          f"{'FILL':>5} {'OUTCOME':<7} {'R':>6}")
+          f"{'GAP%':>6} {'EXT':>6} {'RS10':>7} "
+          f"{'FILL':>5} {'OUTCOME':<18} {'R':>6}")
     print(DIVIDER)
 
     for r in rows:
@@ -306,7 +419,7 @@ def print_signal_table(rows: List[Dict[str, Any]]) -> None:
         ext = r.get("_shadow_ema9_ext_atr")
         rs = r.get("_shadow_rs_gap_vs_spy")
         filled = r.get("_shadow_ema9_filled")
-        outcome = r.get("_shadow_outcome", "").strip() or "—"
+        outcome = _outcome(r) or "—"
         r_val = r.get("_shadow_r_realized")
 
         fill_str = "Y" if filled is True else ("N" if filled is False else "?")
@@ -323,7 +436,7 @@ def print_signal_table(rows: List[Dict[str, Any]]) -> None:
 
         print(f"{date:<12} {ticker:<7} {close_str:>8} {ema9_str:>8} "
               f"{gap_str:>6} {ext_str+ext_flag:>8} {rs_str+rs_flag:>9} "
-              f"{fill_str:>5} {outcome:<7} {r_str:>6}")
+              f"{fill_str:>5} {outcome:<18} {r_str:>6}")
 
 
 def print_fill_rate_section(analysis: Dict[str, Any]) -> None:
@@ -363,25 +476,32 @@ def print_entry_improvement_section(analysis: Dict[str, Any]) -> None:
     print("  e.g. +0.3R means EMA9 entry is 0.3R better than buying at close")
 
 
-def print_outcomes_section(analysis: Dict[str, Any]) -> None:
+def print_outcomes_section(analysis: Dict[str, Any], breakdown: Dict[str, Dict[str, Any]]) -> None:
     print(f"\n{'CLOSED TRADE OUTCOMES':}")
     print(DIVIDER)
     n = analysis.get("n", 0)
     if n == 0:
-        print("  No closed trades yet (SL/TP1/TP2) — fill _shadow_outcome in CSV")
+        print("  No closed trades yet — fill _shadow_outcome in CSV/Sheet")
+        print("  Valid values: SL, TP1_TRAIL, TP2, INVALIDATED_LOSS, INVALIDATED_PROFIT, FLOAT")
         return
     print(f"  Closed trades : {n}")
-    print(f"  Wins (TP1/TP2): {analysis['wins']}")
-    print(f"  Losses (SL)   : {analysis['losses']}")
+    print(f"  Wins          : {analysis['wins']}  (TP1_TRAIL + TP2 + INVALIDATED_PROFIT)")
+    print(f"  Losses        : {analysis['losses']}  (SL + INVALIDATED_LOSS)")
     print(f"  Win rate      : {_pct(analysis['win_rate_pct'])}")
     print(f"  Expectancy    : {_r(analysis['expectancy_r'])} per trade")
     print(f"  Net R         : {_r(analysis['net_r'])}")
     print()
     print(f"  Breakeven WR  : 25.0% (for +3R/−1R profile)")
+    print()
+    print("  Breakdown by category:")
+    for cat, s in breakdown.items():
+        n_cat = s["n"]
+        avg_r = _r(s["avg_r"])
+        print(f"    {cat:<20} n={n_cat:<4} avgR={avg_r}")
 
 
 def print_soft_warning_section(analysis: Dict[str, Any]) -> None:
-    print(f"\n{'SOFT WARNING PREDICTIVE VALUE (F6 / F7)':}")
+    print(f"\n{'SOFT WARNING PREDICTIVE VALUE (F6 / F7 10d)':}")
     print(DIVIDER)
 
     def _row(label: str, s: Dict[str, Any]) -> None:
@@ -396,25 +516,83 @@ def print_soft_warning_section(analysis: Dict[str, Any]) -> None:
     _row(f"F6 ext > {F6_ATR_THRESHOLD}×ATR  (breached)", analysis["f6_breached"])
     _row(f"F6 ext ≤ {F6_ATR_THRESHOLD}×ATR  (ok)",      analysis["f6_ok"])
     print()
-    _row(f"F7 RS gap < {F7_RS_THRESHOLD}%  (breached)", analysis["f7_breached"])
-    _row(f"F7 RS gap ≥ {F7_RS_THRESHOLD}%  (ok)",      analysis["f7_ok"])
+    _row(f"F7 10d RS gap < {F7_RS_THRESHOLD}%  (breached)", analysis["f7_breached"])
+    _row(f"F7 10d RS gap ≥ {F7_RS_THRESHOLD}%  (ok)",      analysis["f7_ok"])
     print()
     print("  Interpretation: if breached WR << ok WR → thresholds are valid")
     print("  If no difference → consider loosening thresholds in config.py")
 
 
+def print_rs_lookback_comparison(analysis: Dict[str, Any]) -> None:
+    """
+    NEW — the actual point of the F7 lookback review: compare 10d vs 60d
+    vs 126d RS gap as predictors of trade outcome, side by side.
+    """
+    print(f"\n{'F7 LOOKBACK COMPARISON: 10d vs 60d vs 126d RS GAP':}")
+    print(DIVIDER)
+    print("  Jegadeesh (1990): 10d sits in the short-term REVERSAL zone")
+    print("  Jegadeesh & Titman (1993): 60d/126d sit in the MOMENTUM zone (skip 21d)")
+    print()
+
+    def _row(label: str, s: Dict[str, Any]) -> None:
+        n = s.get("n", 0)
+        closed = s.get("closed_n", 0)
+        wr = _pct(s.get("win_rate_pct"))
+        avg = _r(s.get("avg_r"))
+        print(f"  {label:<30} n={n:<4} closed={closed:<4} WR={wr:<8} avgR={avg}")
+
+    print(f"  {'Group':<30} {'n':<6} {'closed':<10} {'WR':<9} {'avgR'}")
+    print(f"  {'-'*60}")
+
+    for window_key, window_label in [
+        ("rs_10d", "RS 10d (current F7 gate)"),
+        ("rs_60d", "RS 60d (momentum)"),
+        ("rs_126d", "RS 126d (momentum, robust)"),
+    ]:
+        w = analysis.get(window_key, {})
+        print(f"  -- {window_label} --")
+        _row("  gap < 0 (underperforming)", w.get("negative", {}))
+        _row("  gap ≥ 0 (outperforming)", w.get("non_negative", {}))
+        print()
+
+    print("  Interpretation: look for the window where the two groups'")
+    print("  win rates diverge the MOST. If 60d or 126d separates win/loss")
+    print("  better than 10d, that is evidence F7 should be re-pointed to")
+    print("  a longer lookback. If 10d already separates cleanly while")
+    print("  60d/126d don't, the current 10d gate may be fine as-is.")
+    print("  NOTE: minimum ~10 observations per group before drawing any")
+    print("  conclusion — early Batch 3 data will likely be too thin here.")
+
+
 def print_data_quality_note(rows: List[Dict[str, Any]]) -> None:
-    """Warn if too many manual fields are still blank."""
+    """Warn if too many manual fields are still blank, or outcome values
+    don't match one of the 6 recognised categories."""
     total = len(rows)
     if total == 0:
         return
-    blank_outcome = sum(1 for r in rows if not r.get("_shadow_outcome", "").strip())
+
+    valid_categories = CLOSED_OUTCOMES | OPEN_OUTCOMES
+    blank_outcome = 0
+    unrecognised_outcome = []
     blank_filled = sum(1 for r in rows if r.get("_shadow_ema9_filled") is None)
 
-    if blank_outcome > 0 or blank_filled > 0:
+    for r in rows:
+        o = _outcome(r)
+        if not o:
+            blank_outcome += 1
+        elif o not in valid_categories:
+            unrecognised_outcome.append((r.get("_shadow_ticker", "?"), o))
+
+    if blank_outcome > 0 or blank_filled > 0 or unrecognised_outcome:
         print(f"\n  ⚠  DATA QUALITY: {blank_outcome}/{total} rows missing outcome, "
               f"{blank_filled}/{total} missing ema9_filled")
-        print("     Fill these in shadow_log.csv after each trade closes.")
+        if unrecognised_outcome:
+            print(f"     {len(unrecognised_outcome)} row(s) have an outcome value "
+                  f"that doesn't match any known category:")
+            for ticker, val in unrecognised_outcome[:10]:
+                print(f"       {ticker}: '{val}'")
+            print(f"     Valid values: {', '.join(sorted(valid_categories))}")
+        print("     Fill these in shadow_log.csv / the Sheet after each trade closes.")
 
 
 # ============================================================
@@ -492,12 +670,15 @@ Examples:
         fill_analysis = analyse_fill_rate(rows)
         entry_analysis = analyse_entry_improvement(rows)
         outcome_analysis = analyse_outcomes(closed)
+        outcome_breakdown = analyse_outcome_breakdown(closed)
         soft_analysis = analyse_f6_f7_vs_outcome(rows_with_outcome)
+        rs_lookback_analysis = analyse_rs_lookback_comparison(rows_with_outcome)
 
         print_fill_rate_section(fill_analysis)
         print_entry_improvement_section(entry_analysis)
-        print_outcomes_section(outcome_analysis)
+        print_outcomes_section(outcome_analysis, outcome_breakdown)
         print_soft_warning_section(soft_analysis)
+        print_rs_lookback_comparison(rs_lookback_analysis)
         print_data_quality_note(rows)
 
     print(f"\n{DIVIDER}\n")
