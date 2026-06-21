@@ -53,6 +53,36 @@ FIXED:
     NOT a full passthrough. Any new field added to brief_data in main.py
     that needs to reach the shadow log MUST be added explicitly to the
     dict below, or it will silently be dropped at this exact point.
+
+HAIKU TIE-BREAK FIX (June 2026):
+==================================
+FIXED:
+  - filter_candidates_haiku() previously sorted candidates by Haiku score
+    only (`-score`). Python's sort() is stable, so any tie at the same
+    score was silently broken by whatever order the candidate happened
+    to arrive in — which traces back to S&P 500 universe CSV row order
+    in main.py's run_mandatory_screener(). That has zero relationship to
+    setup quality. Confirmed in production logs (run #48/#50, June 20):
+    ties at score 78 and 72 existed across multiple tickers, and which
+    ones made the top-5 cut was determined purely by CSV position — e.g.
+    a ticker with the strongest ADX margin in its tie group (MMM, ADX
+    58.3) did not make the cut while a ticker with a much weaker margin
+    in the same tie group (APH, ADX 41.2) did, simply because of row
+    order, not quality.
+  - Fix: secondary sort key on ADX(14) (`brief_data["adx_14"]`), descending.
+    ADX margin was chosen over the other four mandatory filters (F1, F3,
+    F4, F5) because it's the only one with a clean monotonic "higher is
+    strictly better" relationship in this system's own data — F3 (RSI)
+    and F4 (volume ratio) both have evidence of the OPPOSITE: a high
+    margin on those two is associated with exhaustion/climax entries
+    (Phase 2.2 diagnostic: DELL RSI 89.4, FIX/KR/LITE near-zero MFE on
+    volume-surge entries), so using them as a quality tie-break would
+    actively reward the failure pattern. ADX margin is also already the
+    dominant phrase in Haiku's own scoring rationale across production
+    logs, and is the explicit example given in FILTER_SYSTEM_PROMPT's
+    "filter strength 50%" weighting ("ADX 38 >> ADX 26").
+  - No new data fetch required — adx_14 is already present in every
+    candidate's brief_data from the mandatory screener stage.
 """
 import json
 import logging
@@ -317,6 +347,13 @@ def filter_candidates_haiku(candidates: List[Dict[str, Any]],
     """
     Run Haiku quality scoring on pre-screened candidates, return top N by score.
     top_n defaults to config.LLM_HAIKU_TOP_N (5).
+
+    Sort key: (-score, -adx_14). See module docstring "HAIKU TIE-BREAK FIX"
+    for why ADX(14) was chosen as the tie-break over the other mandatory
+    filters. Without the secondary key, Python's stable sort would silently
+    break ties by candidate list order (i.e. S&P 500 universe CSV row
+    order), which has no relationship to setup quality — confirmed in
+    production logs (run #48/#50, June 2026).
     """
     if top_n is None:
         top_n = getattr(config, "LLM_HAIKU_TOP_N", 5)
@@ -329,10 +366,16 @@ def filter_candidates_haiku(candidates: List[Dict[str, Any]],
         scored.append({**cand, **result})
         logger.info(f"Haiku scored {ticker}: {result['score']} ({result['reason']})")
 
-    scored.sort(key=lambda x: -x.get("score", 0))
+    scored.sort(
+        key=lambda x: (
+            -x.get("score", 0),
+            -x.get("brief_data", {}).get("adx_14", 0),
+        )
+    )
     top = scored[:top_n]
     logger.info(
-        f"Haiku top {top_n}: {[(c['ticker'], c['score']) for c in top]}"
+        f"Haiku top {top_n}: "
+        f"{[(c['ticker'], c['score'], c.get('brief_data', {}).get('adx_14', 0)) for c in top]}"
     )
     return top
 
