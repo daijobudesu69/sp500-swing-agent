@@ -51,6 +51,30 @@ ADDED (shadow-log only — F7 gate logic UNCHANGED, still gates on 10d):
     Titman 1993 / Springer 2022 momentum convention) will be
     compared against 10d at the next filter review before any
     gate change is made. Zero pipeline risk — additive context only.
+
+PHASE 2.5 — BLACK SWAN REDESIGN (June 2026):
+================================================
+ADDED:
+  - BLACK_SWAN_MARKER_PATH    — dedup marker for Type A alerts (main.py
+    run_black_swan_check() writes the run date here only after a Type A
+    alert sends successfully; reads it first to skip if already alerted
+    today, capping it at 1 alert/UTC-day even if the crash condition
+    stays true across many consecutive 15-min runs).
+  - BLACK_SWAN_HEARTBEAT_PATH — weekly keepalive marker (main.py
+    run_black_swan_heartbeat() always writes the run date here every
+    Friday, regardless of Telegram send status — this is what keeps the
+    repo "active" so GitHub doesn't auto-disable the scheduled workflow
+    after ~60 days with no commits in a quiet market).
+
+NOTE — left intentionally untouched (Phase 2.5):
+  BLACK_SWAN_TYPE_B, BLACK_SWAN_TYPE_C, BLACK_SWAN_RALLY_EMOJI,
+  BLACK_SWAN_INFO_EMOJI, SPY_BLACK_SWAN_RALLY_PCT, VIX_BLACK_SWAN_DROP_PCT
+  are no longer read by anything (run_black_swan_check() now only handles
+  Type A; send_black_swan_rally()/send_black_swan_info() were deleted
+  from telegram_sender.py). Left in place rather than deleted — orphaned
+  config is harmless at zero runtime cost, and removing it risks breaking
+  something outside this file's visibility. Safe to clean up later as a
+  separate, isolated change if desired.
 """
 import os
 from zoneinfo import ZoneInfo
@@ -172,6 +196,20 @@ SHADOW_LOG_PATH = "shadow_log.csv"
 
 
 # ============================================================
+# BLACK SWAN MARKERS (Phase 2.5)
+# ============================================================
+# Type A dedup — main.py reads this before alerting; writes the run date
+# only after a successful send. Caps Telegram spam to 1 alert/UTC-day.
+BLACK_SWAN_MARKER_PATH = ".last_alert_date"
+
+# Weekly heartbeat keepalive — main.py always writes the run date here
+# every Friday run, independent of Telegram send status. The commit this
+# produces is what prevents GitHub from auto-disabling the scheduled
+# workflow during long stretches with no other repo activity.
+BLACK_SWAN_HEARTBEAT_PATH = ".last_heartbeat"
+
+
+# ============================================================
 # TIER 1 VETO (single tier in Stage 2 — applied by Opus)
 # ============================================================
 # 1. Macro regime: VIX < panic OR SPY > 200MA
@@ -194,21 +232,24 @@ TF_PRIMARY = "1d"                       # MAIN decision timeframe
 VIX_PANIC_THRESHOLD = 25.0              # Above = risk-off mode
 VIX_BLACK_SWAN_SPIKE_PCT = 30.0         # Used in Type A trigger
 SPY_BLACK_SWAN_DAILY_DROP_PCT = -3.0    # Used in Type A trigger
-SPY_BLACK_SWAN_RALLY_PCT = 2.0          # Used in Type B trigger
-VIX_BLACK_SWAN_DROP_PCT = -25.0         # Used in Type B trigger
+SPY_BLACK_SWAN_RALLY_PCT = 2.0          # Was used in Type B trigger (Type B removed, Phase 2.5)
+VIX_BLACK_SWAN_DROP_PCT = -25.0         # Was used in Type B trigger (Type B removed, Phase 2.5)
 
 
 # ============================================================
 # BLACK SWAN TIERED RESPONSE
 # ============================================================
-# Type A — RISK-OFF CRASH: HALT new entries + Opus generates defensive ideas
+# Type A — RISK-OFF CRASH: alert only (Phase 2.5 — defensive-idea
+# generation removed; preferred_sectors/preferred_tickers/skip_sectors
+# below are now unused by run_black_swan_check() but kept here in case
+# they're useful reference data later).
 BLACK_SWAN_TYPE_A = {
     "name": "RISK_OFF_CRASH",
     "triggers": {
         "vix_spike_pct_min": 30.0,
         "spy_drop_pct_max": -3.0,
     },
-    "action": "GENERATE_DEFENSIVE_LONGS",
+    "action": "ALERT_ONLY",             # Phase 2.5: was GENERATE_DEFENSIVE_LONGS
     "preferred_sectors": ["Gold", "Energy", "Defense", "Utilities", "Staples"],
     "preferred_tickers": [
         "GLD", "IAU",                   # gold
@@ -219,7 +260,9 @@ BLACK_SWAN_TYPE_A = {
     "skip_sectors": ["Tech", "Discretionary", "Small-caps"],
 }
 
-# Type B — RISK-ON RALLY: alert + sector guidance, no defensive ideas
+# Type B — RISK-ON RALLY: DEPRECATED, Phase 2.5 — no longer detected by
+# run_black_swan_check(), no longer sent by telegram_sender.py. Kept here
+# (orphaned, zero runtime cost) rather than deleted.
 BLACK_SWAN_TYPE_B = {
     "name": "RISK_ON_RALLY",
     "triggers": {
@@ -232,7 +275,7 @@ BLACK_SWAN_TYPE_B = {
     "wait_for_next_scan": True,
 }
 
-# Type C — INFORMATIONAL: RSS keyword + VIX move alert only
+# Type C — INFORMATIONAL: DEPRECATED, Phase 2.5 — same status as Type B above.
 BLACK_SWAN_TYPE_C = {
     "name": "MIXED_INFORMATIONAL",
     "triggers": {
@@ -292,8 +335,12 @@ DAILY_SIGNAL_CRON_PRIMARY_UTC = "0 1 * * 2-6"     # 8:00 AM WIB
 DAILY_SIGNAL_CRON_BACKUP_UTC = "30 1 * * 2-6"     # 8:30 AM WIB (backup if primary fails)
 
 # Black swan watcher — every 15min during US market hours (9:30 AM - 4 PM ET)
-# UTC: 13:30 - 21:00, Mon-Fri
+# UTC: 13:00 - 21:00, Mon-Fri (widened window to safely cover both EST/EDT)
 BLACK_SWAN_CRON_UTC = "*/15 13-21 * * 1-5"
+
+# Black swan heartbeat (Phase 2.5) — weekly, Friday 23:00 UTC (after US close
+# in both EST and EDT)
+BLACK_SWAN_HEARTBEAT_CRON_UTC = "0 23 * * 5"
 
 
 # ============================================================
@@ -306,8 +353,8 @@ HIGH_CONVICTION_EMOJI = "🔥"
 STANDARD_CONVICTION_EMOJI = "📈"
 WATCHLIST_EMOJI = "👁️"
 BLACK_SWAN_CRASH_EMOJI = "🚨"
-BLACK_SWAN_RALLY_EMOJI = "🚀"
-BLACK_SWAN_INFO_EMOJI = "⚡"
+BLACK_SWAN_RALLY_EMOJI = "🚀"            # DEPRECATED Phase 2.5 — Type B removed
+BLACK_SWAN_INFO_EMOJI = "⚡"             # DEPRECATED Phase 2.5 — Type C removed
 NO_SIGNAL_EMOJI = "💤"
 MACRO_ALERT_EMOJI = "🌍"
 MANDATORY_PASS_EMOJI = "🔒"
@@ -345,7 +392,10 @@ RSS_FEEDS = [
 
 
 # ============================================================
-# BLACK SWAN KEYWORD DETECTION (for Type C alerts via RSS)
+# BLACK SWAN KEYWORD DETECTION
+# Still used by run_black_swan_check() (Type A headline context) even
+# though Type C itself is deprecated — detect_black_swan_keywords() is
+# now called directly for crash headline matching, not for a Type C alert.
 # ============================================================
 BLACK_SWAN_KEYWORDS = [
     # War / geopolitical
