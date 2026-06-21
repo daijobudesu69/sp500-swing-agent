@@ -18,6 +18,31 @@ RULE 3 DESIGN (RR):
   - Rationale: a strong setup at 1.8:1 is better than no signal at all
     User makes final entry decision with full context
 
+RULE 4 DESIGN (SIZING MISMATCH) — CHANGED June 2026:
+  - Downgraded from hard reject to soft warning (_sizing_warning).
+  - Position sizing is explicitly out of scope for this system (signal
+    quality + R:R only — sizing is managed manually by the user, per
+    locked design principle). Rejecting valid high-conviction signals
+    (URI, JPM, CVS — confirmed across runs #48/#50) over a fractional-
+    share rounding mismatch in Opus's own math contradicted that
+    principle. The mismatch is still computed and surfaced for
+    visibility — it just no longer blocks the signal.
+  - The budget check (claimed risk vs MAX_RISK_PER_TRADE_PCT) remains a
+    HARD gate — that's a different concern (claim vs account limit, not
+    Opus's internal math consistency) and has no evidence of being broken.
+
+RULE 6 DESIGN (CONVICTION) — CHANGED June 2026:
+  - Downgraded from hard reject to soft warning (_conviction_warning).
+  - Conviction score is proven non-predictive in this system's own data
+    (Phase 2.2 Finding 1: loser avg conviction 75.1 vs winner avg 72.6).
+    A numerical floor with no statistical basis was rejecting signals
+    (e.g. INTC at 58) with no evidence they were actually worse than
+    signals that passed. Conviction is now FYI-only for the user,
+    consistent with the locked principle "conviction score is display-
+    only, never feeds gating logic" (Phase 2.5 §5).
+  - Range sanity (0-100) remains a hard gate — that's a data-integrity
+    check, not a quality gate, and is unaffected by this change.
+
 RULE 8 DESIGN (TIER 1):
   - If tier_1_pass=False due to RR only → soft warning, not rejection
   - Other TIER 1 failures (macro, weekly downtrend) → hard rejection
@@ -27,10 +52,10 @@ RULE 8 DESIGN (TIER 1):
 CATCHES:
   - LLM hallucinations (impossible prices, wrong direction, math errors)
   - Risk rule violations (>3% risk)
-  - Position sizing math errors
   - Sector concentration limits
-  - Conviction tier violations
   - Long-only enforcement
+  (Position sizing math errors and conviction tier are now soft warnings
+   only — see RULE 4 / RULE 6 above.)
 """
 import logging
 from collections import defaultdict
@@ -53,8 +78,9 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
     Validate a single signal against all hard rules.
     Returns (is_valid, list_of_violations).
 
-    Note: Some checks add warnings to signal dict (_rr_warning, _tier1_rr_warning)
-    without rejecting. These are surfaced in Telegram messages for user awareness.
+    Note: Some checks add warnings to signal dict (_rr_warning,
+    _tier1_rr_warning, _sizing_warning, _conviction_warning) without
+    rejecting. These are surfaced in Telegram messages for user awareness.
     """
     violations = []
 
@@ -167,6 +193,7 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
     # ============================================================
     # RULE 4: RISK AMOUNT WITHIN BUDGET
+    # Budget-vs-claim check remains a HARD gate (unchanged).
     # ============================================================
     max_risk_usd = config.ACCOUNT_SIZE_USD * (config.MAX_RISK_PER_TRADE_PCT / 100)
     if risk_amt > max_risk_usd + 0.05:
@@ -175,13 +202,20 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
             f"({config.MAX_RISK_PER_TRADE_PCT}% of ${config.ACCOUNT_SIZE_USD})"
         )
 
-    # Recompute risk to verify Opus math
+    # Recompute risk to verify Opus math.
+    # CHANGED (sizing-mismatch fix, June 2026): downgraded from hard reject to
+    # soft warning. See module docstring "RULE 4 DESIGN" for rationale.
     if pos_size > 0 and entry > 0:
         actual_risk = pos_size * (risk_per_share / entry)
         if abs(actual_risk - risk_amt) > 0.20:
-            violations.append(
-                f"Risk amount mismatch: claimed ${risk_amt:.2f}, "
-                f"computed ${actual_risk:.2f}"
+            warning = (
+                f"⚠️ Sizing mismatch: Opus claimed ${risk_amt:.2f}, "
+                f"computed ${actual_risk:.2f} — sizing is manual, info only"
+            )
+            signal["_sizing_warning"] = warning
+            logger.warning(
+                f"  {signal.get('ticker')} sizing mismatch (non-blocking): "
+                f"claimed ${risk_amt:.2f}, computed ${actual_risk:.2f}"
             )
 
     # ============================================================
@@ -194,13 +228,24 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
         )
 
     # ============================================================
-    # RULE 6: CONVICTION TIER ENFORCEMENT
+    # RULE 6: CONVICTION RANGE SANITY + SOFT THRESHOLD
+    # Range sanity (0-100) remains a HARD gate (data integrity).
+    # CHANGED (June 2026): the CONVICTION_STANDARD threshold is downgraded
+    # from hard reject to soft warning. See module docstring "RULE 6 DESIGN"
+    # for rationale (conviction proven non-predictive in this system's data).
     # ============================================================
     if conviction < 0 or conviction > 100:
         violations.append(f"Conviction {conviction} outside 0-100 range")
-    if conviction < config.CONVICTION_STANDARD:
-        violations.append(
-            f"Conviction {conviction} below threshold {config.CONVICTION_STANDARD}"
+    elif conviction < config.CONVICTION_STANDARD:
+        warning = (
+            f"ℹ️ Conviction {conviction} below {config.CONVICTION_STANDARD} "
+            f"reference threshold — FYI only, not a quality signal (see Phase 2.2 "
+            f"Finding 1: conviction is non-predictive in this system's data)"
+        )
+        signal["_conviction_warning"] = warning
+        logger.warning(
+            f"  {signal.get('ticker')} conviction below reference threshold "
+            f"(non-blocking): {conviction} < {config.CONVICTION_STANDARD}"
         )
 
     # ============================================================
@@ -348,12 +393,16 @@ def validate_and_filter(
             individually_valid.append(sig)
             rr_warn = sig.get("_rr_warning", "")
             tier_warn = sig.get("_tier1_rr_warning", "")
+            sizing_warn = sig.get("_sizing_warning", "")
+            conviction_warn = sig.get("_conviction_warning", "")
             logger.info(
                 f"✓ {sig.get('ticker')} passed "
                 f"(conviction {sig.get('conviction')}, "
                 f"RR {sig.get('rr_ratio')})"
                 + (f" | {rr_warn}" if rr_warn else "")
                 + (f" | {tier_warn}" if tier_warn else "")
+                + (f" | {sizing_warn}" if sizing_warn else "")
+                + (f" | {conviction_warn}" if conviction_warn else "")
             )
         else:
             individually_rejected.append({
@@ -482,6 +531,27 @@ if __name__ == "__main__":
         "conviction": 0,
     }
 
+    # Signal 6: Sizing mismatch (like URI/JPM/CVS) — should PASS with warning
+    sizing_mismatch_signal = {
+        **clean_signal,
+        "ticker": "URI",
+        "entry": 254.10,
+        "stop_loss": 248.50,
+        "tp1": 265.30,
+        "tp2": 276.50,
+        "rr_ratio": 2.00,
+        "position_size_usd": 91.00,
+        "risk_amount_usd": 3.00,   # claimed — but computed will be ~0.13
+        "conviction": 71,
+    }
+
+    # Signal 7: Low conviction (like INTC) — should PASS with warning
+    low_conviction_signal = {
+        **clean_signal,
+        "ticker": "INTC",
+        "conviction": 58,
+    }
+
     print("\n=== Signal 1: NVDA (clean 2:1 RR) ===")
     v, viol = validate_signal(clean_signal)
     print(f"Valid: {v} | Warnings: {clean_signal.get('_rr_warning', 'none')}")
@@ -502,10 +572,19 @@ if __name__ == "__main__":
     v, viol = validate_signal(macro_fail_signal)
     print(f"Valid: {v} | Violations: {viol}")
 
+    print("\n=== Signal 6: URI (sizing mismatch — should now PASS) ===")
+    v, viol = validate_signal(sizing_mismatch_signal)
+    print(f"Valid: {v} | Sizing Warning: {sizing_mismatch_signal.get('_sizing_warning', 'none')}")
+
+    print("\n=== Signal 7: INTC (low conviction — should now PASS) ===")
+    v, viol = validate_signal(low_conviction_signal)
+    print(f"Valid: {v} | Conviction Warning: {low_conviction_signal.get('_conviction_warning', 'none')}")
+
     print("\n=== Full Pipeline ===")
     result = validate_and_filter(
         [clean_signal, low_rr_signal, hallucination_signal,
-         tier_rr_signal, macro_fail_signal],
+         tier_rr_signal, macro_fail_signal, sizing_mismatch_signal,
+         low_conviction_signal],
         ticker_metadata={
             "NVDA": {"sector": "Technology", "sub_industry": "Semiconductors"},
             "AMD": {"sector": "Technology", "sub_industry": "Semiconductors"},
