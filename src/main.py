@@ -11,12 +11,6 @@ CHANGES FROM PHASE 1:
   - Bug fixes: temperature param, cache_control, 4H resample
 
 PRESERVED FROM PHASE 1:
-  - Black swan Type A/B/C logic with full depth
-  - _generate_defensive_ideas() — Opus on defensive tickers during crash
-  - RSS keyword detection for Type C
-  - Intraday VIX spike % detection
-  - Sector preferences per black swan type
-  - Config-driven black swan thresholds
   - ticker_meta passed to risk manager for correlation checks
   - assess_macro_regime() regime classification + TIER 1 veto
   - Two entry points: run_daily_signals() + run_black_swan_check()
@@ -31,11 +25,6 @@ PIPELINE FLOW:
   7. Risk manager validation
   8. Send to Telegram
   9. Shadow log append (CSV + Telegram + Google Sheets)
-
-BLACK SWAN (separate 15-min entry point):
-  Type A — Crash:      VIX spike + SPY drop → HALT + defensive ideas via Opus
-  Type B — Rally:      VIX drop + SPY surge → continue + sector alert
-  Type C — Info:       RSS keyword detection + VIX move → info alert only
 
 PHASE 2.3 REVISION (June 2026):
 ================================
@@ -81,6 +70,49 @@ ADDED:
       INVALIDATED_LOSS    -> discretionary exit pre-TP1, exit price < entry
       INVALIDATED_PROFIT  -> discretionary exit pre-TP1, exit price > entry
       FLOAT               -> still open at time of review (mark-to-market)
+
+PHASE 2.5 — BLACK SWAN REDESIGN (June 2026):
+================================================
+CHANGED — run_black_swan_check():
+  - Type B (rally) & Type C (info) DELETED entirely — less noise,
+    decision is the user's, not the system's.
+  - NO LLM anywhere in black swan path. _generate_defensive_ideas()
+    DELETED — Opus is not predictive on conviction (proven in Phase 2.2
+    data: losers averaged HIGHER conviction than winners), so it has no
+    business picking defensive tickers in a panic either.
+  - "SPY drop" now measured via macro_ctx["spy_1d_change_pct"]
+    (prev close -> now), NOT intraday open->now. This fixes a latent bug:
+    the old code read spy_df["open"]/["close"] (lowercase), but
+    data_fetcher._normalize_columns() always returns UPPERCASE columns
+    (Open/High/Low/Close/Volume) — so the old lowercase access always
+    KeyError'd, was swallowed by try/except, and the function silently
+    never fired. spy_1d_change_pct also correctly captures overnight
+    gap-downs, which intraday open->now would miss entirely.
+  - Dedup added: max 1 Type A alert per UTC calendar day via a marker
+    file (config.BLACK_SWAN_MARKER_PATH), committed back to the repo by
+    the GitHub Actions workflow. Prevents Telegram spam if a crash stays
+    triggered across many consecutive 15-min runs.
+  - Alert is informational only — no "HALT" instruction, no defensive
+    sector list. The trade decision belongs to the user.
+  - Headline context: keyword-matched black-swan headlines first; if
+    none match, falls back to top-3 general market headlines. Either
+    way the message explicitly states the cause is NOT verified by the
+    system and tells the user to research independently.
+ADDED — run_black_swan_heartbeat() (new function):
+  - Runs once a week (Friday 23:00 UTC, via a second cron entry in the
+    same workflow file as the Type A watcher).
+  - Reports current VIX/SPY plus this week's worst single-day SPY return
+    and largest single-day VIX spike, each compared against the Type A
+    thresholds — so the heartbeat also quietly proves the comparison
+    logic is reading real data correctly, not just "I'm alive".
+  - ALWAYS writes config.BLACK_SWAN_HEARTBEAT_PATH, committed weekly by
+    the workflow. This is a deliberate keepalive: GitHub auto-disables
+    scheduled workflows on a repo with no commits for ~60 days, which is
+    a real risk here in a quiet market (shadow_log.csv is intentionally
+    NOT committed, and the Type A marker only commits on a crash day).
+    The weekly heartbeat commit keeps the repo "active" so cron schedules
+    never silently stop firing.
+  - No dedup needed — its own cron only fires once a week.
 """
 import csv
 import logging
@@ -526,53 +558,6 @@ def build_full_data_for_opus(
 
 
 # ============================================================
-# BLACK SWAN — DEFENSIVE IDEAS (preserved from Phase 1)
-# ============================================================
-
-def _generate_defensive_ideas(
-    macro_ctx: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """
-    On crash days: run Opus on config-defined defensive tickers,
-    return approved signals as watchlist ideas.
-    Lightweight — bypasses full screener.
-    """
-    defensive_tickers = getattr(
-        config, "BLACK_SWAN_TYPE_A", {}
-    ).get("preferred_tickers", [])[:6]
-
-    if not defensive_tickers:
-        logger.warning("No defensive tickers configured in BLACK_SWAN_TYPE_A")
-        return []
-
-    ideas = []
-    for ticker in defensive_tickers:
-        try:
-            df = data_mod.fetch_ohlcv(ticker, period="6mo", interval="1d")
-            if df is None:
-                continue
-            brief = ind_mod.build_brief_data(df, ticker=ticker, macro_regime="crash")
-            if brief is None:
-                continue
-            full_data = build_full_data_for_opus(ticker, df, brief, macro_ctx)
-            if full_data is None:
-                continue
-            signal = analyst_mod.opus_deep_analysis(ticker, full_data)
-            if "error" not in signal and signal.get("conviction", 0) >= config.CONVICTION_STANDARD:
-                ideas.append(signal)
-        except Exception as e:
-            logger.warning(f"Defensive idea failed for {ticker}: {e}")
-
-        if len(ideas) >= 3:
-            break
-
-    if ideas:
-        validated = risk_mod.validate_and_filter(ideas, {})
-        return validated.get("approved", [])
-    return []
-
-
-# ============================================================
 # DAILY PIPELINE
 # ============================================================
 
@@ -801,113 +786,202 @@ def run_daily_signals() -> Dict[str, Any]:
 
 
 # ============================================================
-# BLACK SWAN CHECK (every 15 min during US hours)
+# BLACK SWAN — MARKER HELPERS (Phase 2.5)
+#
+# Generic read/write — shared by the Type A dedup marker AND the
+# heartbeat keepalive marker. Two different files, same mechanism.
+# ============================================================
+
+def _read_marker(path: str) -> str:
+    """Read marker file content (string). Returns '' if missing/unreadable."""
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception as e:
+        logger.warning(f"Could not read marker {path}: {e}")
+    return ""
+
+
+def _write_marker(path: str, content: str) -> None:
+    """Write a string to a marker file. The GitHub Actions workflow commits it back."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"Marker written: {path} = {content}")
+    except Exception as e:
+        logger.warning(f"Could not write marker {path}: {e}")
+
+
+# ============================================================
+# BLACK SWAN CHECK — Type A only (every 15 min during US hours)
+#
+# Phase 2.5 redesign — see module docstring for full rationale:
+#   - Type B (rally) & Type C (info): DELETED — less noise (user decision).
+#   - NO LLM. Defensive-idea generation cut entirely. Alert-only; the
+#     trade decision belongs to the user, not the system.
+#   - SPY move measured via spy_1d_change_pct (Opsi X) — fixes the old
+#     lowercase-column bug and correctly captures overnight gaps.
+#   - Dedup: max 1 alert per UTC day via marker file.
+#   - Silent on non-events. Headline context with explicit "unverified,
+#     research yourself" framing.
 # ============================================================
 
 def run_black_swan_check() -> Dict[str, Any]:
-    """
-    Lightweight 15-min intraday monitor.
-    Checks VIX spike, SPY move, RSS keywords.
-    Does NOT run full screener — Telegram alert only (+ defensive ideas on Type A).
-    """
-    logger.info("Black swan check starting...")
+    """Monitor crash intraday — Type A only. See module docstring for design."""
+    logger.info("Black swan check starting (Type A crash watch)...")
     result = {"status": "no_event", "alert_sent": False}
 
     try:
+        run_date = datetime.utcnow().strftime("%Y-%m-%d")
+        marker_path = getattr(config, "BLACK_SWAN_MARKER_PATH", ".last_alert_date")
+
+        # Dedup — already alerted today?
+        if _read_marker(marker_path) == run_date:
+            logger.info(f"Already alerted today ({run_date}) — skip (dedup).")
+            result["status"] = "already_alerted"
+            return result
+
         macro_ctx = data_mod.fetch_market_context()
-        vix = macro_ctx.get("vix", 0)
-        vix_spike_pct = macro_ctx.get("vix_spike_pct", 0)
+        vix = macro_ctx.get("vix", 0.0)
+        vix_spike_pct = macro_ctx.get("vix_spike_pct", 0.0)
+        spy_1d = macro_ctx.get("spy_1d_change_pct", 0.0)  # Opsi X
 
-        # Get accurate intraday SPY move
-        spy_df = data_mod.fetch_ohlcv("SPY", period="5d", interval="1d")
-        spy_change_today = 0.0
-        if spy_df is not None and len(spy_df) >= 2:
-            today_open = float(spy_df["open"].iloc[-1])
-            today_close = float(spy_df["close"].iloc[-1])
-            spy_change_today = ((today_close - today_open) / today_open) * 100
-
-        # RSS keyword scan
-        news = data_mod.fetch_market_news_rss(max_items_per_feed=10)
-        bs_news = data_mod.detect_black_swan_keywords(news)
-
-        market_moves = {
-            "VIX": f"{vix:.2f} ({vix_spike_pct:+.1f}% intraday)",
-            "SPY today": f"{spy_change_today:+.2f}%",
-            "DXY 5d": f"{macro_ctx.get('dxy_5d_change_pct', 0):+.2f}%",
-        }
-        headlines = [n["title"] for n in bs_news[:5]]
-        event_summary = {
-            "headlines": headlines,
-            "market_moves": market_moves,
-        }
-
-        # ------------------------------------------------------------
-        # TYPE A: CRASH — halt + defensive Opus ideas
-        # ------------------------------------------------------------
         type_a_cfg = getattr(config, "BLACK_SWAN_TYPE_A", {})
-        type_a_triggers = type_a_cfg.get("triggers", {})
-        is_type_a = (
-            vix_spike_pct >= type_a_triggers.get("vix_spike_pct_min", 20)
-            or spy_change_today <= type_a_triggers.get("spy_drop_pct_max", -3.0)
-        )
-        if is_type_a:
-            logger.warning(
-                f"BLACK SWAN TYPE A — VIX spike {vix_spike_pct:+.1f}%, "
-                f"SPY {spy_change_today:+.2f}%"
-            )
-            event_summary["preferred_sectors"] = type_a_cfg.get("preferred_sectors", [])
-            trade_ideas = _generate_defensive_ideas(macro_ctx)
-            tg_mod.send_black_swan_crash(event_summary, trade_ideas)
-            result["status"] = "type_a_crash"
-            result["alert_sent"] = True
-            return result
+        triggers = type_a_cfg.get("triggers", {})
+        vix_min = triggers.get("vix_spike_pct_min", 30.0)
+        spy_max = triggers.get("spy_drop_pct_max", -3.0)
 
-        # ------------------------------------------------------------
-        # TYPE B: RALLY — alert + sector guidance
-        # ------------------------------------------------------------
-        type_b_cfg = getattr(config, "BLACK_SWAN_TYPE_B", {})
-        type_b_triggers = type_b_cfg.get("triggers", {})
-        vix_drop_pct = -vix_spike_pct if vix_spike_pct < 0 else 0
-        is_type_b = (
-            vix_drop_pct >= type_b_triggers.get("vix_drop_pct_max", 15)
-            or spy_change_today >= type_b_triggers.get("spy_rally_pct_min", 3.0)
-        )
-        if is_type_b:
+        is_type_a = (vix_spike_pct >= vix_min) or (spy_1d <= spy_max)
+
+        if not is_type_a:
             logger.info(
-                f"BLACK SWAN TYPE B — VIX drop {vix_drop_pct:.1f}%, "
-                f"SPY {spy_change_today:+.2f}%"
+                f"No Type A trigger (VIX spike {vix_spike_pct:+.1f}% < {vix_min}, "
+                f"SPY 1d {spy_1d:+.2f}% > {spy_max}). Silent pass."
             )
-            event_summary["preferred_sectors"] = type_b_cfg.get("preferred_sectors", [])
-            event_summary["skip_sectors"] = type_b_cfg.get("skip_sectors", [])
-            tg_mod.send_black_swan_rally(event_summary)
-            result["status"] = "type_b_rally"
-            result["alert_sent"] = True
             return result
 
-        # ------------------------------------------------------------
-        # TYPE C: INFO — RSS keyword match + VIX movement
-        # ------------------------------------------------------------
-        type_c_cfg = getattr(config, "BLACK_SWAN_TYPE_C", {})
-        type_c_triggers = type_c_cfg.get("triggers", {})
-        vix_abs_change = abs(vix_spike_pct)
-        is_type_c = (
-            bs_news
-            and vix_abs_change >= type_c_triggers.get("vix_change_pct_abs_min", 10)
+        # ---- Type A fired ----
+        logger.warning(
+            f"BLACK SWAN TYPE A — VIX spike {vix_spike_pct:+.1f}%, "
+            f"SPY 1d {spy_1d:+.2f}%"
         )
-        if is_type_c:
-            logger.info(f"BLACK SWAN TYPE C — {len(bs_news)} keyword matches, VIX {vix_abs_change:.1f}% move")
-            tg_mod.send_black_swan_info(event_summary)
-            result["status"] = "type_c_info"
-            result["alert_sent"] = True
-            return result
 
-        logger.info(
-            f"No black swan triggers fired "
-            f"(VIX={vix:.2f}, spike={vix_spike_pct:+.1f}%, SPY={spy_change_today:+.2f}%)"
-        )
+        # Headline context: keyword-match first, fallback to general market news.
+        headlines: List[str] = []
+        headline_source = "none"
+        try:
+            news = data_mod.fetch_market_news_rss(max_items_per_feed=10)
+            bs_news = data_mod.detect_black_swan_keywords(news)
+            if bs_news:
+                headlines = [n["title"] for n in bs_news[:5]]
+                headline_source = "keyword"
+            elif news:
+                headlines = [n["title"] for n in news[:3]]
+                headline_source = "general"
+        except Exception as news_err:
+            logger.warning(f"Headline fetch failed (non-critical): {news_err}")
+
+        event_summary = {
+            "market_moves": {
+                "VIX": f"{vix:.2f} ({vix_spike_pct:+.1f}% intraday)",
+                "SPY today": f"{spy_1d:+.2f}% (1d)",
+            },
+            "headlines": headlines,
+            "headline_source": headline_source,
+        }
+
+        sent = tg_mod.send_black_swan_crash(event_summary)
+        if sent:
+            _write_marker(marker_path, run_date)  # only mark if the alert actually sent
+        result["status"] = "type_a_crash"
+        result["alert_sent"] = sent
+        return result
 
     except Exception as e:
         logger.error(f"Black swan check error: {e}")
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return result
+
+
+# ============================================================
+# BLACK SWAN HEARTBEAT — weekly, Friday 23:00 UTC (Phase 2.5)
+#
+# See module docstring for full rationale. Short version: proves the
+# watcher's threshold-comparison logic is reading real data each week
+# (A2), and doubles as a repo-activity keepalive so GitHub never
+# auto-disables the scheduled cron during a quiet market.
+# ============================================================
+
+def _compute_weekly_extremes() -> Dict[str, float]:
+    """
+    Worst single-day SPY return & largest single-day VIX spike over the
+    last ~5 trading days. Fail-soft — returns 0.0 on insufficient data.
+    """
+    out = {"worst_spy_day_pct": 0.0, "max_vix_spike_pct": 0.0}
+
+    try:
+        spy_df = data_mod.fetch_ohlcv("SPY", period="5d", interval="1d")
+        if spy_df is not None and len(spy_df) >= 2:
+            daily_rets = spy_df["Close"].pct_change().dropna() * 100
+            if len(daily_rets) > 0:
+                out["worst_spy_day_pct"] = round(float(daily_rets.min()), 2)
+    except Exception as e:
+        logger.warning(f"Weekly SPY extreme compute failed: {e}")
+
+    try:
+        vix_df = data_mod.fetch_ohlcv("^VIX", period="5d", interval="1d")
+        if vix_df is not None and len(vix_df) >= 2:
+            daily_spikes = vix_df["Close"].pct_change().dropna() * 100
+            if len(daily_spikes) > 0:
+                out["max_vix_spike_pct"] = round(float(daily_spikes.max()), 2)
+    except Exception as e:
+        logger.warning(f"Weekly VIX extreme compute failed: {e}")
+
+    return out
+
+
+def run_black_swan_heartbeat() -> Dict[str, Any]:
+    """
+    Weekly heartbeat — Friday 23:00 UTC. Always sends Telegram + always
+    commits the keepalive marker (no dedup here; its own cron only fires
+    once a week by design).
+    """
+    logger.info("Black swan heartbeat starting...")
+    result = {"status": "sent", "alert_sent": False}
+
+    try:
+        run_date = datetime.utcnow().strftime("%Y-%m-%d")
+        heartbeat_path = getattr(config, "BLACK_SWAN_HEARTBEAT_PATH", ".last_heartbeat")
+
+        macro_ctx = data_mod.fetch_market_context()
+        weekly_extremes = _compute_weekly_extremes()
+
+        type_a_cfg = getattr(config, "BLACK_SWAN_TYPE_A", {})
+        triggers = type_a_cfg.get("triggers", {})
+        vix_min = triggers.get("vix_spike_pct_min", 30.0)
+        spy_max = triggers.get("spy_drop_pct_max", -3.0)
+
+        event_summary = {
+            "vix_now": macro_ctx.get("vix", 0.0),
+            "spy_price_now": macro_ctx.get("spy_price", 0.0),
+            "worst_spy_day_pct": weekly_extremes["worst_spy_day_pct"],
+            "max_vix_spike_pct": weekly_extremes["max_vix_spike_pct"],
+            "spy_threshold": spy_max,
+            "vix_threshold": vix_min,
+        }
+
+        sent = tg_mod.send_black_swan_heartbeat(event_summary)
+        result["alert_sent"] = sent
+
+        # Keepalive: always commit regardless of send status — this is
+        # what prevents GitHub from auto-disabling the cron on a quiet repo.
+        _write_marker(heartbeat_path, run_date)
+
+    except Exception as e:
+        logger.error(f"Black swan heartbeat error: {e}")
         result["status"] = "error"
         result["error"] = str(e)
 
@@ -924,7 +998,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SP500 Swing Agent")
     parser.add_argument(
         "--mode",
-        choices=["daily", "black_swan", "test"],
+        choices=["daily", "black_swan", "heartbeat", "test"],
         default="daily",
     )
     parser.add_argument(
@@ -938,6 +1012,8 @@ if __name__ == "__main__":
         result = run_daily_signals()
     elif args.mode == "black_swan":
         result = run_black_swan_check()
+    elif args.mode == "heartbeat":
+        result = run_black_swan_heartbeat()
     elif args.mode == "test":
         # Quick single-ticker debug — skips full pipeline
         logger.info(f"=== TEST MODE: {args.ticker} ===")
