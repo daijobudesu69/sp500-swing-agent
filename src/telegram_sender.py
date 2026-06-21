@@ -7,8 +7,6 @@ ADDED:
   - Mandatory vs Optional clear display in signals (per user request)
   - RR warning flags surfaced from risk_manager (_rr_warning, _tier1_rr_warning)
   - Conviction tier emoji selection (HIGH 🔥 / STANDARD 📈 / WATCHLIST 👁️)
-  - Type A black swan defensive ideas display
-  - Type B/C alert formatting
 
 PHASE 2.3 REVISION (June 2026):
 ================================
@@ -22,15 +20,43 @@ CHANGED:
 ADDED:
   - send_shadow_log(): sends shadow log summary message after daily signals
 
+PHASE 2.5 — BLACK SWAN REDESIGN (June 2026):
+================================================
+CHANGED — send_black_swan_crash():
+  - Dropped the `trade_ideas` parameter entirely. The old function would
+    render a "Defensive watchlist for tomorrow" section sourced from
+    Opus-generated tickers (main.py's _generate_defensive_ideas(), now
+    deleted). LLM conviction scores were proven non-predictive in Phase
+    2.2 data (losers averaged HIGHER conviction than winners), so Opus
+    has no business picking defensive tickers in a panic either — that
+    whole code path is gone, not just hidden.
+  - Dropped the prescriptive "HALT new long entries, wait 1-2 days" line
+    and the "Defensive sectors to watch" list. The trade decision belongs
+    to the user now, not the system.
+  - Headline section reworked: keyword-matched headlines are labelled as
+    such; if the watcher found none, it falls back to general market
+    headlines and labels them differently. Either way the message now
+    states explicitly that the cause is NOT verified by the system and
+    tells the user to research independently before acting.
+DELETED — send_black_swan_rally(), send_black_swan_info():
+  - Type B (rally) and Type C (info) alerts are gone from the black swan
+    watcher (main.py run_black_swan_check() no longer detects or calls
+    these). Dead code removed rather than left orphaned.
+ADDED — send_black_swan_heartbeat():
+  - Weekly (Friday 23:00 UTC) liveness + keepalive message. Reports
+    current VIX/SPY plus the worst single-day SPY move and largest
+    single-day VIX spike seen in the past week, each compared against
+    the Type A thresholds — so the heartbeat also proves the threshold
+    comparison logic is reading real data, not just "I'm alive".
+
 FUNCTIONS:
-  send_daily_signals()       — Main signal delivery (header + each signal)
-  send_shadow_log()          — Shadow log summary (after daily signals)
-  send_no_signal_day()       — Explain why no signals fired
-  send_black_swan_crash()    — Type A alert + defensive ideas
-  send_black_swan_rally()    — Type B alert + sector guidance
-  send_black_swan_info()     — Type C informational alert
-  send_test_message()        — Connectivity test
-  _send_message()            — Low-level Telegram API call
+  send_daily_signals()         — Main signal delivery (header + each signal)
+  send_shadow_log()            — Shadow log summary (after daily signals)
+  send_no_signal_day()         — Explain why no signals fired
+  send_black_swan_crash()      — Type A alert (alert-only, no LLM, no ideas)
+  send_black_swan_heartbeat()  — Weekly liveness + keepalive message
+  send_test_message()          — Connectivity test
+  _send_message()              — Low-level Telegram API call
 
 API DETAILS:
   Uses legacy Markdown parse mode (no escaping for dots/dollar signs)
@@ -392,16 +418,23 @@ def send_no_signal_day(
 
 
 # ============================================================
-# BLACK SWAN ALERTS
+# BLACK SWAN — TYPE A ALERT (Phase 2.5 redesign)
+#
+# trade_ideas parameter removed entirely — no LLM, no defensive watchlist.
+# No prescriptive action line ("HALT...") — decision belongs to the user.
+# Headline section now carries an explicit "unverified, research yourself"
+# caveat, and distinguishes keyword-matched headlines from general
+# fallback headlines so the user knows how strong the context actually is.
 # ============================================================
 
-def send_black_swan_crash(
-    event_summary: Dict[str, Any],
-    trade_ideas: List[Dict[str, Any]],
-) -> bool:
+def send_black_swan_crash(event_summary: Dict[str, Any]) -> bool:
     """
-    Type A: Risk-off crash detected.
-    Sends alert + defensive trade ideas (if Opus generated any).
+    Type A: crash detected. Alert-only (no LLM, no defensive ideas).
+
+    event_summary expected keys:
+      market_moves      — dict of label -> formatted string (VIX, SPY today)
+      headlines          — list of headline strings (possibly empty)
+      headline_source    — "keyword" | "general" | "none"
     """
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
@@ -413,104 +446,86 @@ def send_black_swan_crash(
         msg += f"- {k}: {v}\n"
     msg += "\n"
 
-    msg += "⚠️ *Action*\n"
-    msg += "HALT new long entries. Wait 1-2 days for stabilization.\n\n"
-
-    preferred = event_summary.get("preferred_sectors", [])
-    if preferred:
-        msg += "🛡️ *Defensive sectors to watch*\n"
-        for sector in preferred:
-            msg += f"- {sector}\n"
-        msg += "\n"
-
     headlines = event_summary.get("headlines", [])
+    source = event_summary.get("headline_source", "none")
+
     if headlines:
-        msg += "📰 *Recent headlines*\n"
+        if source == "keyword":
+            msg += "📰 *Possible context* (keyword-matched headlines)\n"
+        else:
+            msg += "📰 *Possible context* (general market headlines)\n"
         for h in headlines[:5]:
-            msg += f"- {h[:100]}\n"
+            msg += f"- {h[:110]}\n"
         msg += "\n"
+        msg += "⚠️ *News can't be verified — do your own research NOW.*\n"
+        msg += "_Cause not confirmed by the system; headlines are context only._\n\n"
+    else:
+        msg += "⚠️ *No headlines retrieved — cause unknown. Do your own research NOW.*\n\n"
 
-    success = _send_message(msg)
-
-    if trade_ideas:
-        ideas_header = (
-            f"💡 *Defensive watchlist for tomorrow* — {len(trade_ideas)} ideas\n\n"
-        )
-        for s in trade_ideas:
-            sig_emoji, _ = _conviction_tier(s.get("conviction", 0))
-            ideas_header += f"{sig_emoji} {s.get('ticker')} — {s.get('conviction')}/100\n"
-        _send_message(ideas_header)
-
-        for idea in trade_ideas:
-            _send_message(_format_signal(idea))
-
-    return success
-
-
-def send_black_swan_rally(
-    event_summary: Dict[str, Any],
-) -> bool:
-    """
-    Type B: Risk-on rally detected.
-    Alert + sector guidance only — no defensive ideas.
-    """
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-
-    msg = f"{config.BLACK_SWAN_RALLY_EMOJI} *BLACK SWAN — TYPE B: RALLY*\n"
-    msg += f"_{timestamp}_\n\n"
-
-    msg += "📈 *Market moves*\n"
-    for k, v in event_summary.get("market_moves", {}).items():
-        msg += f"- {k}: {v}\n"
-    msg += "\n"
-
-    msg += "⚠️ *Action*\n"
-    msg += "Avoid chasing breakouts. Wait for pullback or consolidation.\n\n"
-
-    preferred = event_summary.get("preferred_sectors", [])
-    if preferred:
-        msg += "✅ *Preferred sectors*\n"
-        msg += ", ".join(preferred) + "\n\n"
-
-    skip = event_summary.get("skip_sectors", [])
-    if skip:
-        msg += "❌ *Skip sectors*\n"
-        msg += ", ".join(skip) + "\n\n"
-
-    headlines = event_summary.get("headlines", [])
-    if headlines:
-        msg += "📰 *Recent headlines*\n"
-        for h in headlines[:3]:
-            msg += f"- {h[:100]}\n"
+    msg += "🔎 Threshold breached. The trade decision is yours."
 
     return _send_message(msg)
 
 
-def send_black_swan_info(
-    event_summary: Dict[str, Any],
-) -> bool:
+# ============================================================
+# BLACK SWAN — WEEKLY HEARTBEAT (Phase 2.5, new)
+#
+# A2 design: not just "I'm alive" — reports this week's worst SPY day
+# and largest VIX spike compared against the same Type A thresholds, so
+# the message also proves the comparison logic is reading real data.
+# Sent every Friday 23:00 UTC regardless of whether Type A fired that
+# week. The marker write that follows this (in main.py) is what actually
+# keeps the repo "active" so GitHub doesn't auto-disable the cron.
+# ============================================================
+
+def send_black_swan_heartbeat(event_summary: Dict[str, Any]) -> bool:
     """
-    Type C: Informational alert (RSS keywords + VIX move).
-    No action required, just FYI.
+    Weekly liveness + keepalive message.
+
+    event_summary expected keys:
+      vix_now              — float
+      spy_price_now        — float
+      worst_spy_day_pct    — float (most negative single-day SPY return this week)
+      max_vix_spike_pct    — float (largest single-day VIX spike this week)
+      spy_threshold        — float (Type A SPY trigger, e.g. -3.0)
+      vix_threshold        — float (Type A VIX trigger, e.g. 30.0)
     """
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    msg = f"{config.BLACK_SWAN_INFO_EMOJI} *BLACK SWAN — TYPE C: NEWS ALERT*\n"
+    vix_now = event_summary.get("vix_now", 0.0)
+    spy_now = event_summary.get("spy_price_now", 0.0)
+    worst_spy_day = event_summary.get("worst_spy_day_pct", 0.0)
+    max_vix_spike = event_summary.get("max_vix_spike_pct", 0.0)
+    spy_threshold = event_summary.get("spy_threshold", -3.0)
+    vix_threshold = event_summary.get("vix_threshold", 30.0)
+
+    spy_breached = worst_spy_day <= spy_threshold
+    vix_breached = max_vix_spike >= vix_threshold
+
+    msg = "💓 *BLACK SWAN WATCHER — Weekly Heartbeat*\n"
     msg += f"_{timestamp}_\n\n"
 
-    msg += "📊 *Market moves*\n"
-    for k, v in event_summary.get("market_moves", {}).items():
-        msg += f"- {k}: {v}\n"
-    msg += "\n"
+    msg += "📊 *Right now*\n"
+    msg += f"- VIX: {vix_now:.2f}\n"
+    msg += f"- SPY: ${spy_now:.2f}\n\n"
 
-    headlines = event_summary.get("headlines", [])
-    if headlines:
-        msg += "📰 *Triggered keywords in headlines*\n"
-        for h in headlines[:5]:
-            msg += f"- {h[:120]}\n"
-        msg += "\n"
+    msg += "📅 *This week's extremes vs Type A thresholds*\n"
+    msg += (
+        f"- Worst SPY day: {worst_spy_day:+.2f}% "
+        f"(threshold {spy_threshold:+.1f}%) "
+        f"{'⚠ breached' if spy_breached else '✓ within range'}\n"
+    )
+    msg += (
+        f"- Max VIX spike: {max_vix_spike:+.1f}% "
+        f"(threshold {vix_threshold:+.1f}%) "
+        f"{'⚠ breached' if vix_breached else '✓ within range'}\n\n"
+    )
 
-    msg += "ℹ️ Informational only. No action required."
+    if spy_breached or vix_breached:
+        msg += "ℹ️ A threshold was crossed this week — check your crash alerts.\n"
+    else:
+        msg += "✅ Watcher alive. No Type A crash this week."
+
     return _send_message(msg)
 
 
@@ -587,3 +602,28 @@ if __name__ == "__main__":
     print("\n=== Mock Shadow Log ===")
     mock_shadow_msg = send_shadow_log([mock_signal], "2026-06-01")
     print(f"Shadow log sent: {mock_shadow_msg}")
+
+    print("\n=== Mock Black Swan Crash (keyword) ===")
+    mock_crash_event = {
+        "market_moves": {
+            "VIX": "34.20 (+31.5% intraday)",
+            "SPY today": "-3.40% (1d)",
+        },
+        "headlines": [
+            "Markets tumble as Fed signals emergency rate concerns",
+            "Bank stocks slide amid contagion fears",
+        ],
+        "headline_source": "keyword",
+    }
+    print(f"Crash alert sent: {send_black_swan_crash(mock_crash_event)}")
+
+    print("\n=== Mock Black Swan Heartbeat ===")
+    mock_heartbeat_event = {
+        "vix_now": 16.8,
+        "spy_price_now": 745.30,
+        "worst_spy_day_pct": -1.2,
+        "max_vix_spike_pct": 12.4,
+        "spy_threshold": -3.0,
+        "vix_threshold": 30.0,
+    }
+    print(f"Heartbeat sent: {send_black_swan_heartbeat(mock_heartbeat_event)}")
