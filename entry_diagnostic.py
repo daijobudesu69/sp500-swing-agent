@@ -65,6 +65,28 @@ normalizes every row's keys to the underscore-prefixed form immediately
 on read, via _normalize_fieldnames(). Every other function in this file
 is unchanged and only ever sees the canonical "_shadow_*" key names,
 regardless of which naming convention the source CSV used.
+
+LEGACY ROW-ARTIFACT SKIP — June 21 2026:
+=======================================
+Two bugs in sheets_logger.py (now fixed at the source, see that file's
+docstring) could leave stale artifacts baked into a Google Sheet export
+taken BEFORE that fix:
+  1. Duplicate-header bug: a second, code-inserted header row landed on
+     top of the user's original hand-curated header row. In a CSV
+     export, csv.DictReader treats whichever row is physically first as
+     the field names — the OTHER header row then gets read back as if
+     it were a real trade row, with literal text like "shadow_ticker"
+     sitting in the ticker column instead of an actual ticker symbol.
+  2. Row-gap bug: append_rows() could land the next day's rows below a
+     blank gap row, which reads back as a row of all-empty strings.
+
+Neither bug can recur going forward — sheets_logger.py writes are now
+position-explicit and never touch an existing header — but a CSV
+exported before that fix can still contain these two artifact types.
+load_shadow_log() now detects and skips both via _is_blank_row() and
+_is_header_artifact_row(), printing a one-line summary of how many rows
+were skipped and why. This is cleanup for stale exports only, not a
+defense against anything the current sheets_logger.py can still produce.
 """
 import argparse
 import csv
@@ -132,6 +154,58 @@ def _normalize_fieldnames(row: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
+def _is_blank_row(row: Dict[str, str]) -> bool:
+    """
+    True if every value in the row is empty/whitespace. Catches the
+    row-gap artifact from the (now-fixed) sheets_logger.py append_rows()
+    bug — a gap row reads back as all-empty-string values.
+
+    Handles csv.DictReader's restkey/restval edge cases: if a row has
+    more columns than the header, the extras land under a `None` key as
+    a list; if it has fewer, missing fields come back as `None` rather
+    than "". Both are treated as blank/empty here rather than failing
+    the check, since a truly blank source row can produce either shape
+    depending on exact comma count.
+    """
+    for key, value in row.items():
+        if key is None:
+            # Extra fields beyond the header — csv.DictReader's restkey.
+            if isinstance(value, list):
+                if any(str(v).strip() != "" for v in value):
+                    return False
+            elif str(value).strip() != "":
+                return False
+            continue
+        if value is None:
+            continue  # missing field (restval) — counts as blank
+        if str(value).strip() != "":
+            return False
+    return True
+
+
+def _is_header_artifact_row(row: Dict[str, str]) -> bool:
+    """
+    True if this row's values look like header text rather than real
+    trade data — the signature of the (now-fixed) duplicate-header bug,
+    where one header row got read back as a data row by csv.DictReader.
+
+    Heuristic: check the ticker field specifically. A real ticker is a
+    short alphanumeric string (e.g. "BNY", "UNH"); a header-artifact row
+    will instead contain something like "shadow_ticker" or
+    "_shadow_ticker" in that same column. This is checked against both
+    naming conventions since the artifact row could be either the old
+    hand-curated header or the canonical HEADER list, depending on which
+    one ended up in the data-row position for a given export.
+    """
+    ticker_val = str(row.get("_shadow_ticker", "")).strip().lower()
+    if not ticker_val:
+        return False
+    header_like = {f.lower() for f in _CANONICAL_FIELDS} | {
+        f.lstrip("_").lower() for f in _CANONICAL_FIELDS
+    }
+    return ticker_val in header_like
+
+
 def load_shadow_log(csv_path: str) -> List[Dict[str, Any]]:
     """
     Load shadow_log.csv into a list of dicts.
@@ -149,11 +223,26 @@ def load_shadow_log(csv_path: str) -> List[Dict[str, Any]]:
         return []
 
     rows = []
+    skipped_blank = 0
+    skipped_header_artifact = 0
+
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            normalized = _normalize_fieldnames(row)
+        for raw_row in reader:
+            if _is_blank_row(raw_row):
+                skipped_blank += 1
+                continue
+            normalized = _normalize_fieldnames(raw_row)
+            if _is_header_artifact_row(normalized):
+                skipped_header_artifact += 1
+                continue
             rows.append(_coerce_row(normalized))
+
+    if skipped_blank or skipped_header_artifact:
+        print(f"[INFO] Skipped {skipped_blank} blank row(s) and "
+              f"{skipped_header_artifact} header-artifact row(s) — "
+              f"legacy cleanup from a since-fixed sheets_logger.py bug. "
+              f"See module docstring for detail.")
 
     return rows
 
