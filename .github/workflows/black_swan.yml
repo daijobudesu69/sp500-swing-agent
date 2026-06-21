@@ -1,0 +1,72 @@
+name: Black Swan Watcher
+
+on:
+  schedule:
+    # Watcher — Type A crash check, tiap 15 menit, 13:00-21:00 UTC, Mon-Fri.
+    # Window UTC lebar untuk cover EST (UTC-5) & EDT (UTC-4).
+    # Run di luar jam market tetap jalan tapi silent-pass (harmless, $0).
+    - cron: "*/15 13-21 * * 1-5"
+    # Heartbeat — Jumat 23:00 UTC (aman setelah US close, EST maupun EDT).
+    - cron: "0 23 * * 5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode buat manual test"
+        required: true
+        default: "black_swan"
+        type: choice
+        options:
+          - black_swan
+          - heartbeat
+
+permissions:
+  contents: write   # perlu commit .last_alert_date / .last_heartbeat
+
+concurrency:
+  group: black-swan-watcher
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine mode
+        id: pick_mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 23 * * 5" ]; then
+            echo "mode=heartbeat" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=black_swan" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m src.main --mode ${{ steps.pick_mode.outputs.mode }}
+
+      - name: Commit marker files (if changed)
+        run: |
+          git add -A -- .last_alert_date .last_heartbeat 2>/dev/null || true
+          if [[ -n "$(git status --porcelain -- .last_alert_date .last_heartbeat)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: black swan marker update [skip ci]"
+            git push
+          else
+            echo "No marker change — nothing to commit."
+          fi
