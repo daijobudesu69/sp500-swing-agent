@@ -64,17 +64,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          staged_any=false
           for f in .last_alert_date .last_heartbeat; do
             if [ -f "$f" ]; then
               git add -- "$f"
-              staged_any=true
             fi
           done
 
-          if [ "$staged_any" = true ] && [ -n "$(git status --porcelain --cached)" ]; then
+          if git diff --cached --quiet; then
+            echo "No marker change — nothing to commit."
+          else
             git commit -m "chore: black swan marker update [skip ci]"
             git push
-          else
-            echo "No marker change — nothing to commit."
           fi
