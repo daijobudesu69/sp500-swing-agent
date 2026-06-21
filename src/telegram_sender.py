@@ -49,6 +49,22 @@ ADDED — send_black_swan_heartbeat():
     the Type A thresholds — so the heartbeat also proves the threshold
     comparison logic is reading real data, not just "I'm alive".
 
+WARNING DISPLAY FIX (June 2026):
+==================================
+ADDED:
+  - _sizing_warning and _conviction_warning surfaced in the same
+    "Warnings" block as the existing _rr_warning / _tier1_rr_warning.
+    These two fields started being set by risk_manager.py once the
+    sizing-mismatch check (RULE 4) and the conviction threshold check
+    (RULE 6) were downgraded from hard rejects to soft, non-blocking
+    warnings — signals that previously never reached Telegram at all
+    (e.g. URI/JPM/CVS on sizing, INTC on conviction — confirmed across
+    runs #48/#50, June 20 2026) now pass through but should still show
+    the underlying flag here so the user has the same visibility they'd
+    have gotten from a rejection log line, just without the signal being
+    blocked. Without this change, those two warnings only ever showed up
+    in GitHub Actions logs, never in the message the user actually reads.
+
 FUNCTIONS:
   send_daily_signals()         — Main signal delivery (header + each signal)
   send_shadow_log()            — Shadow log summary (after daily signals)
@@ -201,6 +217,10 @@ def _format_signal(signal: Dict[str, Any]) -> str:
       - Confluence label = "context only"
       - Soft warnings section (F6 + F7)
       - max_holding_days line removed
+
+    June 2026 changes:
+      - Risk manager warnings block now also surfaces _sizing_warning and
+        _conviction_warning (see module docstring "WARNING DISPLAY FIX").
     """
     ticker = signal.get("ticker", "?")
     conviction = int(signal.get("conviction", 0))
@@ -272,13 +292,21 @@ def _format_signal(signal: Dict[str, Any]) -> str:
         msg += f"- RR:          {breakdown.get('rr_asymmetry', 0)}/10\n\n"
 
     # ── Risk manager warnings ────────────────────────────────
+    # CHANGED (June 2026): added _sizing_warning and _conviction_warning —
+    # see module docstring "WARNING DISPLAY FIX" for why these two exist now.
     rr_warn = signal.get("_rr_warning", "")
     tier_warn = signal.get("_tier1_rr_warning", "")
+    sizing_warn = signal.get("_sizing_warning", "")
+    conviction_warn = signal.get("_conviction_warning", "")
     warnings_text = ""
     if rr_warn:
         warnings_text += f"- {rr_warn}\n"
     if tier_warn:
         warnings_text += f"- {tier_warn}\n"
+    if sizing_warn:
+        warnings_text += f"- {sizing_warn}\n"
+    if conviction_warn:
+        warnings_text += f"- {conviction_warn}\n"
 
     if warnings_text:
         msg += f"{config.WARNING_EMOJI} *Warnings*\n{warnings_text}\n"
@@ -598,6 +626,23 @@ if __name__ == "__main__":
 
     print("\n=== Mock Signal Format ===")
     print(_format_signal(mock_signal))
+
+    print("\n=== Mock Signal With Sizing + Conviction Warnings ===")
+    mock_signal_warned = {
+        **mock_signal,
+        "ticker": "URI",
+        "conviction": 58,
+        "_sizing_warning": (
+            "⚠️ Sizing mismatch: Opus claimed $3.00, computed $0.13 — "
+            "sizing is manual, info only"
+        ),
+        "_conviction_warning": (
+            "ℹ️ Conviction 58 below 65 reference threshold — FYI only, not a "
+            "quality signal (see Phase 2.2 Finding 1: conviction is "
+            "non-predictive in this system's data)"
+        ),
+    }
+    print(_format_signal(mock_signal_warned))
 
     print("\n=== Mock Shadow Log ===")
     mock_shadow_msg = send_shadow_log([mock_signal], "2026-06-01")
