@@ -17,7 +17,7 @@ Setup (one-time):
        GSHEET_TAB      = (optional) worksheet/tab name, default "shadow_log"
   5. requirements.txt: add  gspread>=6.0.0  and  google-auth>=2.30.0
 
-HEADER ROBUSTNESS FIX (June 2026):
+HEADER ROBUSTNESS FIX (June 2026, round 1):
 ====================================
 The original header-write check was `if not ws.get_all_values()`, which only
 writes the header when the sheet is COMPLETELY empty. This silently failed
@@ -25,12 +25,36 @@ once: data was written to a tab whose row 1 was not actually empty (e.g. a
 stray formatted cell), so the header was permanently skipped and every
 auto-logged field appeared to be in the wrong place with no labels.
 
-Fixed by checking row 1's actual contents against HEADER, not just
-"does anything exist in the sheet":
-  - Row 1 is empty / sheet has no rows at all  -> append HEADER as row 1
-  - Row 1 exists but does NOT match HEADER      -> INSERT a new row 1 with
-    HEADER, pushing existing data down (never overwrites existing rows)
-  - Row 1 already matches HEADER                -> do nothing
+DUPLICATE-HEADER BUG FIX (June 21 2026, round 2):
+====================================
+The round-1 fix introduced a NEW bug: it compared row 1 against HEADER with
+an exact match, and on mismatch it INSERTED a fresh canonical header row
+above whatever was already there. In production, row 1 held a hand-curated
+header (different naming convention — no leading underscore — plus an extra
+"Remarks" column the user had added manually). Because that header could
+never exact-match HEADER, every run after the round-1 fix shipped, the code
+inserted a second header row on top of the user's own header — producing
+the two-header-row stack seen in the sheet.
+
+Round-2 fix: stop trying to validate/replace an existing header at all.
+If row 1 has ANY content — canonical or hand-curated — leave it alone.
+Only write HEADER when row 1 is genuinely empty (brand-new tab). This
+trusts whatever header convention the user has actually set up in the
+sheet, which is the thing this function kept breaking.
+
+ROW-GAP BUG FIX (June 21 2026, round 2):
+====================================
+`ws.append_rows()` asks the Sheets API to auto-detect the end of the
+existing "table" before appending below it. Data-validation dropdowns
+applied to a large pre-formatted range (e.g. `_shadow_outcome` validation
+dragged down to row 1000) can throw this detection off, causing the next
+day's rows to land further down than the actual last data row — producing
+a visible blank-row gap between one day's entries and the next.
+
+Fixed by replacing append_rows() with an explicit-position write: read the
+actual row count via get_all_values(), then update() starting at
+row_count + 1. This is deterministic — there is no "detect the table"
+step left for a dropdown or stray cell to confuse, so a gap can't form.
 """
 import os
 import json
@@ -47,7 +71,9 @@ _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Must match the exact keys written by _append_shadow_log() in main.py
 # (same dicts are passed to append_shadow_rows() — no renaming/adapter layer,
 # so this list IS the single source of truth for shadow_log.csv column order
-# AND the Sheet column order).
+# AND the Sheet column order, for any tab that is genuinely empty when first
+# written. Existing hand-curated headers are left untouched — see
+# _ensure_header() docstring above).
 HEADER = [
     "_shadow_date",
     "_shadow_ticker",
@@ -101,30 +127,26 @@ def _worksheet():
 
 def _ensure_header(ws) -> None:
     """
-    Make sure row 1 of the worksheet is exactly HEADER.
+    Write HEADER only if row 1 is genuinely empty (brand-new tab).
 
-    Checks row 1's actual contents (not "is the sheet empty") so this is
-    robust to: a brand-new empty tab, a tab whose row 1 already has stray
-    formatting/whitespace, or a tab that was reset/cleared after rows were
-    already written. Never overwrites existing data rows — if row 1 isn't
-    HEADER, a new row is INSERTED above whatever is already there.
+    Round-2 fix: this function used to compare row 1 against HEADER and
+    INSERT a fresh header on any mismatch — which duplicated the user's
+    own hand-curated header (different naming convention + extra columns)
+    every run. It no longer validates or replaces an existing header at
+    all. If row 1 already has anything in it, this is a no-op — whatever
+    header the user has in place is trusted as-is.
     """
     try:
         current_row1 = ws.row_values(1)
     except Exception:
         current_row1 = []
 
-    if current_row1 == HEADER:
-        return  # already correct, nothing to do
-
-    if not current_row1:
-        # Sheet (or row 1) is genuinely empty — safe to append directly.
-        ws.append_row(HEADER, value_input_option="USER_ENTERED")
+    if current_row1:
+        # Row 1 already has content (canonical or hand-curated) — leave it.
         return
 
-    # Row 1 exists but doesn't match HEADER — insert a fresh row 1 above
-    # it so existing data (whatever it is) shifts down and is preserved.
-    ws.insert_row(HEADER, index=1, value_input_option="USER_ENTERED")
+    # Row 1 is genuinely empty — safe to write the canonical header.
+    ws.append_row(HEADER, value_input_option="USER_ENTERED")
 
 
 def append_shadow_rows(rows):
@@ -132,6 +154,11 @@ def append_shadow_rows(rows):
     rows: list[dict] keyed by HEADER (the SAME dicts written to shadow_log.csv
     by _append_shadow_log() in main.py — pass them through unmodified).
     Returns True on success, False on any failure (never raises).
+
+    Round-2 fix: writes at an explicit position (get_all_values() row count + 1)
+    instead of append_rows(), which avoids the Sheets API's table-end
+    auto-detection — the mechanism behind the observed blank-row gap between
+    days. See module docstring "ROW-GAP BUG FIX" for detail.
     """
     try:
         ws = _worksheet()
@@ -142,9 +169,20 @@ def append_shadow_rows(rows):
         _ensure_header(ws)
 
         payload = [[r.get(c, "") for c in HEADER] for r in rows]
-        ws.append_rows(payload, value_input_option="USER_ENTERED")
-        print(f"[sheets_logger] appended {len(payload)} row(s) to Google Sheet.")
+        if not payload:
+            print("[sheets_logger] no rows to write — skipped.")
+            return True
+
+        existing = ws.get_all_values()
+        next_row = len(existing) + 1
+        end_row = next_row + len(payload) - 1
+        end_col_a1 = gspread.utils.rowcol_to_a1(1, len(HEADER))      # e.g. "AC1"
+        end_col_letters = "".join(ch for ch in end_col_a1 if ch.isalpha())
+        target_range = f"A{next_row}:{end_col_letters}{end_row}"
+
+        ws.update(target_range, payload, value_input_option="USER_ENTERED")
+        print(f"[sheets_logger] wrote {len(payload)} row(s) to Google Sheet starting at row {next_row}.")
         return True
     except Exception as e:                               # non-blocking by design
-        print(f"[sheets_logger] append failed (non-blocking): {e}")
+        print(f"[sheets_logger] write failed (non-blocking): {e}")
         return False
