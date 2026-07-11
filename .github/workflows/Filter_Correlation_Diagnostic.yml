@@ -10,27 +10,35 @@ name: Filter Correlation Diagnostic
 # a report to the Actions log.
 #
 # NO CRON. Fires only when you click "Run workflow" in the Actions tab.
-# This is deliberate: it is a diagnostic you run occasionally, not a
-# scheduled job.
 #
 # IMPORTANT — avoid running this in the same window as the 08:00 WIB
 # (01:00 UTC) daily pipeline. Both fetch ~503 tickers from yfinance;
-# firing them close together risks yfinance rate-limiting. Run this a few
-# hours off the daily window, or on a weekend when the daily cron is idle.
+# firing them close together risks yfinance rate-limiting.
 #
 # SECRETS: none are strictly required — this script makes zero LLM calls
 # and does not read FRED for the correlation itself. FRED_API_KEY is wired
 # in only for the optional macro context line in data_fetcher; if it's
-# absent the script still runs and produces the full correlation report.
+# absent the script still runs fine.
+#
+# FIX (this version) — the FULL-UNIVERSE-BY-DEFAULT bug:
+#   Previous version had `default: "50"` on the `limit` input. GitHub
+#   Actions re-populates the form with the LAST-USED value on reopen, and
+#   in testing the "50" stuck even when the box was manually cleared —
+#   so every run kept using --limit 50 no matter what. Root fix: this
+#   input now defaults to the literal word "full" instead of a number.
+#   Typing "full" (or leaving it as-is) always means the full universe.
+#   Typing any number (e.g. 50) means --limit 50. This removes the
+#   ambiguity between "blank string" and "GitHub's remembered default"
+#   entirely — there is no blank/non-blank edge case left to hit.
 # ============================================================
 
 on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Number of tickers to process (blank = full universe ~503). Start with 50 for a safe first run."
-        required: false
-        default: "50"
+        description: 'Type "full" for the entire ~503-ticker universe, or a number (e.g. 50) for a quick test.'
+        required: true
+        default: "full"
         type: string
 
 # Read-only: this workflow does not commit anything back to the repo.
@@ -63,10 +71,12 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
           LIMIT_INPUT="${{ github.event.inputs.limit }}"
-          if [ -n "$LIMIT_INPUT" ]; then
-            echo "Running with --limit $LIMIT_INPUT"
-            python filter_correlation.py --limit "$LIMIT_INPUT"
-          else
-            echo "Running full universe (no limit)"
+          echo "Raw input received: '$LIMIT_INPUT'"
+
+          if [ "$LIMIT_INPUT" = "full" ] || [ -z "$LIMIT_INPUT" ]; then
+            echo ">>> Running FULL universe (no --limit passed)"
             python filter_correlation.py
+          else
+            echo ">>> Running with --limit $LIMIT_INPUT"
+            python filter_correlation.py --limit "$LIMIT_INPUT"
           fi
