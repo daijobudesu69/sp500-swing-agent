@@ -1,0 +1,32 @@
+name: Hurst Lookback Analysis (Session 2 — Stochastic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Ticker limit — type 'full' for the entire universe or a number (e.g. 50) for a quick test"
+        required: true
+        type: string
+
+jobs:
+  run-hurst-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Hurst / OU lookback diagnostic
+        run: |
+          if [ "${{ github.event.inputs.limit }}" = "full" ]; then
+            python hurst_lookback_analysis.py
+          else
+            python hurst_lookback_analysis.py --limit ${{ github.event.inputs.limit }}
+          fi
