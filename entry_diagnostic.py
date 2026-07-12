@@ -18,7 +18,7 @@ USAGE:
 MANUAL FIELDS REQUIRED (fill in shadow_log.csv after each trade closes):
   _shadow_ema9_filled   True / False
   _shadow_outcome       SL / TP1_TRAIL / TP2 / INVALIDATED_LOSS /
-                         INVALIDATED_PROFIT / FLOAT
+                         INVALIDATED_PROFIT / FLOAT / TIME_TP / TIME_SL
   _shadow_r_realized    float (e.g. -1.0, 3.0, 0.53, 2.67) — see the
                          "R Calculator" sheet tab for the formula per category
   _shadow_hold_days     int
@@ -49,6 +49,24 @@ CHANGED:
     each lookback's breach status and reports win rate / avg R per
     lookback so the three windows can be compared side by side at the
     next filter review.
+
+TIME-STOP OUTCOME CATEGORIES ADDED — July 2026
+================================================
+CHANGED:
+  - Two new outcome categories added: TIME_TP and TIME_SL. Both apply
+    when a trade is held to the max-hold limit (10 trading days, ~14
+    calendar days) WITHOUT TP1 ever being tagged, and is closed manually
+    at that point rather than via SL or TP1_TRAIL:
+      TIME_TP  -> win,  closed (still in profit when max hold reached)
+      TIME_SL  -> loss, closed (still in loss/breakeven when max hold reached)
+    These sit alongside, not instead of, the existing 6 categories. A
+    trade that DID tag TP1 before the hold limit is always TP1_TRAIL (or
+    TP2), never TIME_TP/TIME_SL, regardless of how long it was ultimately
+    held — the time-stop categories only apply to trades that never
+    reached TP1.
+    Outcome category count: 8 (was 6). WIN_OUTCOMES/LOSS_OUTCOMES,
+    analyse_outcome_breakdown(), and the wins/losses labels in
+    print_outcomes_section() were all updated accordingly.
 
 HEADER NORMALIZATION FIX — June 2026:
 =======================================
@@ -105,9 +123,10 @@ F6_ATR_THRESHOLD = 1.5             # extension threshold in ATR units
 F7_RS_THRESHOLD = -3.5             # RS gap threshold in % (10d, current hard config value)
 DIVIDER = "─" * 72
 
-# Outcome category classification (Phase 2.3 F7 review — 6 states)
-WIN_OUTCOMES = {"TP1_TRAIL", "TP2", "INVALIDATED_PROFIT"}
-LOSS_OUTCOMES = {"SL", "INVALIDATED_LOSS"}
+# Outcome category classification (Phase 2.3 F7 review — 6 states,
+# extended July 2026 with TIME_TP/TIME_SL — 8 states total)
+WIN_OUTCOMES = {"TP1_TRAIL", "TP2", "INVALIDATED_PROFIT", "TIME_TP"}
+LOSS_OUTCOMES = {"SL", "INVALIDATED_LOSS", "TIME_SL"}
 CLOSED_OUTCOMES = WIN_OUTCOMES | LOSS_OUTCOMES   # everything except FLOAT / blank
 OPEN_OUTCOMES = {"FLOAT"}
 
@@ -317,8 +336,9 @@ def is_loss(row: Dict[str, Any]) -> bool:
 
 def get_closed(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Rows whose outcome is one of the 6 known closed categories:
-    SL, TP1_TRAIL, TP2, INVALIDATED_LOSS, INVALIDATED_PROFIT.
+    Rows whose outcome is one of the 8 known closed categories:
+    SL, TP1_TRAIL, TP2, INVALIDATED_LOSS, INVALIDATED_PROFIT,
+    TIME_TP, TIME_SL.
     Excludes FLOAT and blank/unrecognised outcomes.
     """
     return [r for r in rows if is_closed(r)]
@@ -405,8 +425,9 @@ def analyse_outcomes(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Win rate and expectancy on closed trades.
     A trade counts as a win if its outcome is in WIN_OUTCOMES
-    (TP1_TRAIL, TP2, INVALIDATED_PROFIT) and a loss if in LOSS_OUTCOMES
-    (SL, INVALIDATED_LOSS). FLOAT is excluded upstream by get_closed().
+    (TP1_TRAIL, TP2, INVALIDATED_PROFIT, TIME_TP) and a loss if in
+    LOSS_OUTCOMES (SL, INVALIDATED_LOSS, TIME_SL). FLOAT is excluded
+    upstream by get_closed().
     """
     if not closed:
         return {"n": 0}
@@ -429,11 +450,15 @@ def analyse_outcomes(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def analyse_outcome_breakdown(closed: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Per-category breakdown across all 6 outcome states (closed only).
+    Per-category breakdown across all 8 outcome states (closed only).
     Useful to see e.g. how much of the win bucket is TP1_TRAIL vs TP2
-    vs INVALIDATED_PROFIT, rather than just a flat win/loss number.
+    vs INVALIDATED_PROFIT vs TIME_TP, rather than just a flat win/loss
+    number.
     """
-    categories = ["SL", "TP1_TRAIL", "TP2", "INVALIDATED_LOSS", "INVALIDATED_PROFIT"]
+    categories = [
+        "SL", "TP1_TRAIL", "TP2", "INVALIDATED_LOSS", "INVALIDATED_PROFIT",
+        "TIME_TP", "TIME_SL",
+    ]
     out = {}
     for cat in categories:
         cat_rows = [r for r in closed if _outcome(r) == cat]
@@ -629,11 +654,12 @@ def print_outcomes_section(analysis: Dict[str, Any], breakdown: Dict[str, Dict[s
     n = analysis.get("n", 0)
     if n == 0:
         print("  No closed trades yet — fill _shadow_outcome in CSV/Sheet")
-        print("  Valid values: SL, TP1_TRAIL, TP2, INVALIDATED_LOSS, INVALIDATED_PROFIT, FLOAT")
+        print("  Valid values: SL, TP1_TRAIL, TP2, INVALIDATED_LOSS,")
+        print("                INVALIDATED_PROFIT, FLOAT, TIME_TP, TIME_SL")
         return
     print(f"  Closed trades : {n}")
-    print(f"  Wins          : {analysis['wins']}  (TP1_TRAIL + TP2 + INVALIDATED_PROFIT)")
-    print(f"  Losses        : {analysis['losses']}  (SL + INVALIDATED_LOSS)")
+    print(f"  Wins          : {analysis['wins']}  (TP1_TRAIL + TP2 + INVALIDATED_PROFIT + TIME_TP)")
+    print(f"  Losses        : {analysis['losses']}  (SL + INVALIDATED_LOSS + TIME_SL)")
     print(f"  Win rate      : {_pct(analysis['win_rate_pct'])}")
     print(f"  Expectancy    : {_r(analysis['expectancy_r'])} per trade")
     print(f"  Net R         : {_r(analysis['net_r'])}")
@@ -713,7 +739,7 @@ def print_rs_lookback_comparison(analysis: Dict[str, Any]) -> None:
 
 def print_data_quality_note(rows: List[Dict[str, Any]]) -> None:
     """Warn if too many manual fields are still blank, or outcome values
-    don't match one of the 6 recognised categories."""
+    don't match one of the 8 recognised categories."""
     total = len(rows)
     if total == 0:
         return
