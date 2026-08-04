@@ -113,6 +113,103 @@ ADDED — run_black_swan_heartbeat() (new function):
     The weekly heartbeat commit keeps the repo "active" so cron schedules
     never silently stop firing.
   - No dedup needed — its own cron only fires once a week.
+
+PHASE 2.6 — REAL CAPITAL PREP (August 2026):
+================================================
+Batch 4 is the first batch executed with real money, on a $100 account.
+Everything below exists to make that batch READABLE, not to raise
+expectancy. No F1-F7 threshold is touched (Benjamini-Hochberg on Batch 3
+returned 0/9 significant hypotheses — there is no evidence to act on yet).
+
+ADDED — running equity + waterfall sizing:
+  Risk is now 2% of CURRENT equity, not a fixed dollar amount. Equity is
+  derived from CLOSED shadow-log rows via sheets_logger.read_equity():
+
+      equity = ACCOUNT_START_USD + sum(r_realized * risk_usd)
+
+  Unfilled and FLOAT rows have no r_realized and are skipped automatically.
+  Within one run, same-day signals cascade off a running basis:
+      signal 1 -> 2% of equity
+      signal 2 -> 2% of (equity - signal 1 risk)
+      signal 3 -> 2% of (equity - signal 1 - signal 2)
+  Cascade order is Haiku score descending (see "HAIKU IS NOW RANK-ONLY").
+
+  WHY 3% -> 2% (structural, not an alpha change): at 3% the required
+  notional is risk / stop_pct. Stop is 1.5 x ATR and F5 floors ATR at 1.5%,
+  so stop can be as tight as 2.25% -> notional up to 133% of the account,
+  which risk_manager RULE 5 rejects. RULE 4 and RULE 5 were mutually
+  unsatisfiable for any signal with ATR between 1.5% and 2.0% — that, not
+  LLM arithmetic, was the true cause of the long-running "sizing mismatch"
+  warnings. At 2%, stop >= 2.25% > 2.00% always, so the conflict is gone
+  and RULE 4 could be restored to a hard gate.
+
+ADDED — Sheets read path is now on the sizing critical path:
+  This module's long-standing contract is that Sheets failures never block
+  signal delivery. That contract is PRESERVED via a cache: the last good
+  equity read is written to config.EQUITY_CACHE_PATH and committed back to
+  the repo by the workflow. On a failed read the cached value is used AND a
+  Telegram warning is sent. Silently falling back to ACCOUNT_START_USD is
+  explicitly forbidden — it would mis-size every trade with no symptom.
+
+ADDED — two-stage entry (STAGE 0 + STAGE 9):
+  Stage 1 is unchanged: a limit order at EMA9.
+  Stage 2 is new: if the session low entered [EMA9, EMA9 + 0.15 x ATR] but
+  the limit never filled, the signal is executed at market on the next open.
+
+  The pipeline was STATELESS across days, so this needed somewhere to
+  remember yesterday. Chosen: a separate Sheets tab (PENDING_ENTRIES_TAB)
+  rather than threading state through the main flow. Reason: anything that
+  fails there must not be able to block signal delivery, and a separate tab
+  is also immune to future column changes in shadow_log.
+
+  STAGE 9 (end of run) queues every signal just sent as PENDING.
+  STAGE 0 (start of next run) reads them back, looks at the session that
+  has since completed, and resolves each one:
+      low <= ema9        -> FILLED     (entry_type "strict")
+      low <= zone_high   -> FALLBACK   (entry_type "fallback", Stage 2 alert)
+      otherwise          -> EXPIRED
+  Expiry is one trading day: without it a weeks-old near-miss could fire on
+  an unrelated price. This also yields an automatic fill-rate metric, which
+  previously had to be reconstructed by hand.
+
+  NOTE: the system never learns the ACTUAL fill price — the operator
+  executes manually and types it into the pending tab's actual_entry column.
+  Stage 2 stop/TP must be recomputed from that real fill, not from EMA9.
+
+ADDED — shadow-log columns (see sheets_logger.HEADER for the full list):
+  risk_usd, entry_type, force_closed, discretionary_action, veto_reason,
+  spy_vs_sma20, vix_level, pct_above_50dma.
+
+  risk_usd is REQUIRED for the equity calculation: r_realized is scale-free
+  and cannot be converted back into dollars once risk floats with equity.
+
+  discretionary_action / veto_reason exist because Batch 4 is manually
+  filtered. Without them the batch is unreadable — there would be no way to
+  separate "the system performed well" from "the operator vetoed the bad
+  ones". Recording them also lets vetoes be scored against actual outcomes.
+
+  The three regime fields are LOG ONLY and gate nothing. A regime hard gate
+  was tested on Batch 3 and rejected: it improved backtested R but removed
+  the 6 largest winners (+8.4R combined) and cut breadth 32 -> 13, roughly
+  36% of statistical power.
+
+  NAMING: the field is spy_vs_sma20, not spy_vs_ema20 as originally
+  sketched. fetch_market_context() returns spy_sma20 (a simple moving
+  average); labelling an SMA as an EMA would silently mislead whoever
+  analyses this column later.
+
+FIXED — shadow-log field list drift:
+  _append_shadow_log() kept its own hard-coded copy of the field list,
+  parallel to sheets_logger.HEADER. Two lists meant the CSV and the Sheet
+  could silently disagree. The CSV list is now DERIVED from
+  sheets_logger.HEADER, so they cannot drift again.
+
+HAIKU IS NOW RANK-ONLY:
+  Haiku scoring logic is unchanged and still ranks candidates for Opus, but
+  the score is not displayed. It is also the cascade order for waterfall
+  sizing. Honest caveat: the score failed Benjamini-Hochberg on Batch 3, so
+  as a ranker it is close to arbitrary — it is used because it is already
+  there and adds no new code, not because it is known to work.
 """
 import csv
 import logging
@@ -299,6 +396,28 @@ def _build_shadow_rows(signals: List[Dict[str, Any]], run_date: str) -> List[Dic
             "_shadow_outcome": "",
             "_shadow_r_realized": "",
             "_shadow_hold_days": "",
+
+            # ---- PHASE 2.6 ----
+            # risk_usd is AUTO and must never be blank: read_equity() needs it
+            # to convert scale-free r_realized back into dollars. A blank here
+            # makes the row invisible to the equity calculation.
+            "_shadow_risk_usd": sig.get("risk_amount_usd", ""),
+            # "strict" at write time. STAGE 0 of the NEXT run rewrites the
+            # pending tab with the resolved value; a fallback entry is
+            # identified there, not here.
+            "_shadow_entry_type": ind.get("entry_type", "strict"),
+            # Manual: TRUE only when an administrative batch cutoff closed the
+            # position, rather than its own stop/target/time rule.
+            "_shadow_force_closed": "",
+            # Manual: TAKEN / VETOED / MODIFIED, plus free-text reason.
+            # Batch 4 is manually filtered; without these the batch cannot be
+            # attributed between system and operator.
+            "_shadow_discretionary_action": "",
+            "_shadow_veto_reason": "",
+            # Regime context — LOG ONLY, gates nothing.
+            "_shadow_spy_vs_sma20": ind.get("spy_vs_sma20", ""),
+            "_shadow_vix_level": ind.get("vix_level", ""),
+            "_shadow_pct_above_50dma": ind.get("pct_above_50dma", ""),
         })
     return rows
 
@@ -322,39 +441,11 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> List[Dic
     """
     log_path = getattr(config, "SHADOW_LOG_PATH", "shadow_log.csv")
 
-    fieldnames = [
-        # Auto-logged
-        "_shadow_date",
-        "_shadow_ticker",
-        "_shadow_close_price",
-        "_shadow_ema9_price",
-        "_shadow_ema9_gap_pct",
-        "_shadow_ema9_ext_atr",
-        "_shadow_atr",
-        "_shadow_atr_pct",
-        "_shadow_rs_gap_vs_spy",
-        "_shadow_spy_10d_return",
-        "_shadow_stock_10d_return",
-        "_shadow_rs_60d_gap",
-        "_shadow_rs_126d_gap",
-        "_shadow_conviction",
-        "_shadow_confluence_count",
-        "_shadow_haiku_score",
-        "_shadow_adx",
-        "_shadow_rsi",
-        "_shadow_volume_ratio",
-        "_shadow_entry_close",
-        "_shadow_entry_ema9",
-        "_shadow_stop",
-        "_shadow_tp1",
-        "_shadow_tp2",
-        "_shadow_rr",
-        # Manual fill-in (blank on write)
-        "_shadow_ema9_filled",
-        "_shadow_outcome",
-        "_shadow_r_realized",
-        "_shadow_hold_days",
-    ]
+    # PHASE 2.6: derived from sheets_logger.HEADER instead of being a second
+    # hard-coded copy. Previously the CSV list and the Sheet list were
+    # maintained separately, so adding a column to one silently desynced it
+    # from the other. One list, one source of truth.
+    fieldnames = list(sheets_mod.HEADER)
 
     rows = _build_shadow_rows(signals, run_date)
     file_exists = os.path.isfile(log_path)
@@ -382,6 +473,7 @@ def _append_shadow_log(signals: List[Dict[str, Any]], run_date: str) -> List[Dic
 def run_mandatory_screener(
     universe_df: pd.DataFrame,
     macro_regime: str,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run 5-filter mandatory screener via indicators.py on full universe.
@@ -399,6 +491,18 @@ def run_mandatory_screener(
       candidate and stores it in the candidate dict + brief_data for Haiku context.
       SPY is fetched ONCE before the loop (not per ticker).
 
+    Phase 2.6 — market breadth (NOT a gate, shadow-only):
+      If stats_out is provided, fills in pct_above_ema50 = the share of
+      successfully-screened tickers trading above their own EMA(50).
+      This is free: F1 already computes above_ema_50 for every ticker in the
+      universe, so breadth costs no extra fetch and no extra compute — it was
+      simply being discarded. Optional keyword arg so existing callers are
+      unaffected.
+
+      Recorded for the Batch 4 regime review only. It gates nothing: a regime
+      hard gate was tested on Batch 3 and rejected (better backtested R, but
+      it removed the 6 largest winners and cut breadth 32 -> 13).
+
     Phase 2.3 — F7 lookback review (NOT a hard gate, shadow-only):
       Also computes rs_60d_gap and rs_126d_gap (skip-21d momentum convention)
       for the SAME candidates that already passed F1-F5, using the SAME
@@ -407,6 +511,8 @@ def run_mandatory_screener(
     """
     candidates = []
     errors = 0
+    screened_ok = 0          # Phase 2.6 breadth denominator
+    above_ema50 = 0          # Phase 2.6 breadth numerator
     total = len(universe_df)
     logger.info(f"Screening {total} tickers via mandatory 5-filter screener...")
 
@@ -452,6 +558,14 @@ def run_mandatory_screener(
             )
             if brief is None:
                 continue
+
+            # Phase 2.6 breadth tally — counted for EVERY successfully
+            # screened ticker, not just those passing all five filters.
+            # Counting only the passers would make breadth ~100% by
+            # construction and therefore meaningless.
+            screened_ok += 1
+            if brief.get("above_ema_50"):
+                above_ema50 += 1
 
             if brief.get("all_mandatory_pass"):
                 # ------------------------------------------------
@@ -518,8 +632,14 @@ def run_mandatory_screener(
     if errors > 0:
         logger.warning(f"Screener completed with {errors} fetch errors")
 
+    breadth = round(above_ema50 / screened_ok * 100, 2) if screened_ok else ""
+    if stats_out is not None:
+        stats_out["pct_above_ema50"] = breadth
+        stats_out["screened_ok"] = screened_ok
+
     logger.info(
-        f"Mandatory screener: {len(candidates)} candidates from {total} universe"
+        f"Mandatory screener: {len(candidates)} candidates from {total} universe "
+        f"| breadth above EMA50: {breadth}% of {screened_ok} screened"
     )
     return candidates
 
@@ -561,6 +681,301 @@ def build_full_data_for_opus(
 # DAILY PIPELINE
 # ============================================================
 
+
+# ============================================================
+# PHASE 2.6 — RUNNING EQUITY (Sheets read + local cache fallback)
+# ============================================================
+
+def _load_equity_cache() -> Optional[float]:
+    """
+    Read the last known-good equity from config.EQUITY_CACHE_PATH.
+
+    The file is written after every successful Sheets read and committed
+    back to the repo by the workflow — each Actions run is a fresh
+    checkout, so without that commit the cache would never survive.
+    """
+    path = getattr(config, "EQUITY_CACHE_PATH", ".last_equity")
+    try:
+        with open(path, "r") as f:
+            return float(f.read().strip())
+    except Exception:
+        return None
+
+
+def _save_equity_cache(equity: float) -> None:
+    """Persist equity for the next run's fallback. Never raises."""
+    path = getattr(config, "EQUITY_CACHE_PATH", ".last_equity")
+    try:
+        with open(path, "w") as f:
+            f.write(f"{equity:.4f}\n")
+    except Exception as e:
+        logger.warning(f"Could not write equity cache: {e}")
+
+
+def _resolve_equity() -> Dict[str, Any]:
+    """
+    Resolve the equity basis for this run, in strict priority order:
+
+      1. Live Sheets read      -> authoritative, refreshes the cache
+      2. Local cache           -> stale but real; ALWAYS warns
+      3. ACCOUNT_START_USD     -> last resort, warns LOUDLY
+
+    Level 3 is the dangerous one and is deliberately noisy. Silently sizing
+    off the starting balance after months of trading would understate or
+    overstate every position with no visible symptom — which is exactly the
+    failure mode that let the Sheets mirror no-op for 22 days unnoticed.
+
+    Returns {equity, source, warnings[]}.
+    """
+    out = {"equity": float(config.ACCOUNT_START_USD), "source": "start", "warnings": []}
+
+    equity, meta = sheets_mod.read_equity()
+
+    if equity is not None:
+        out["equity"] = float(equity)
+        out["source"] = "sheets"
+        _save_equity_cache(out["equity"])
+        logger.info(
+            f"Equity from Sheets: ${out['equity']:.2f} "
+            f"({meta.get('closed_rows', 0)} closed row(s))"
+        )
+        if meta.get("skipped_no_risk"):
+            out["warnings"].append(
+                f"{meta['skipped_no_risk']} closed row(s) have r_realized but no "
+                f"risk_usd — their P&L is INVISIBLE to equity. Backfill risk_usd."
+            )
+        stale = meta.get("stale_rows") or []
+        if stale:
+            listed = ", ".join(f"{t} ({int(d)}d)" for t, d in stale[:5])
+            out["warnings"].append(
+                f"{len(stale)} row(s) still have no outcome past "
+                f"{config.EQUITY_STALE_WARN_DAYS}d: {listed}. "
+                f"Equity is running behind reality until they are filled in."
+            )
+        return out
+
+    cached = _load_equity_cache()
+    if cached is not None:
+        out["equity"] = float(cached)
+        out["source"] = "cache"
+        out["warnings"].append(
+            f"Sheets equity read FAILED ({meta.get('error', 'unknown')}). "
+            f"Using cached equity ${cached:.2f}. Sizing may be stale — verify "
+            f"the sheet before executing."
+        )
+        logger.warning(f"Equity from CACHE: ${cached:.2f}")
+        return out
+
+    out["warnings"].append(
+        f"Sheets equity read FAILED and NO cache exists. Falling back to "
+        f"starting equity ${config.ACCOUNT_START_USD:.2f}. If this is not "
+        f"genuinely the first run, DO NOT execute these sizes."
+    )
+    logger.error("Equity unresolved — using ACCOUNT_START_USD.")
+    return out
+
+
+def _apply_waterfall_sizing(signals: List[Dict[str, Any]], equity: float) -> float:
+    """
+    Size a batch of same-day signals off a running basis, highest Haiku
+    score first:
+
+        signal 1 -> 2% of equity
+        signal 2 -> 2% of (equity - signal 1 risk)
+        signal 3 -> 2% of (equity - signal 1 - signal 2)
+
+    What is deducted is RISK, not notional. Total notional across signals
+    can therefore exceed the cash balance — that is expected and is the
+    operator's call at execution time, which is why the Telegram message
+    shows the basis and risk for each signal rather than a single number.
+
+    Returns the remaining basis after the cascade.
+    """
+    basis = float(equity)
+    ranked = sorted(
+        signals,
+        key=lambda x: (_safe_float(x.get("_haiku_score"), 0.0)),
+        reverse=True,
+    )
+    for rank, sig in enumerate(ranked, start=1):
+        risk_mod.apply_position_sizing(sig, basis)
+        sig["_size_rank"] = rank
+        basis -= float(sig.get("risk_amount_usd", 0) or 0)
+        if basis <= 0:
+            logger.warning("Waterfall basis exhausted — remaining signals size to ~0.")
+            basis = 0.0
+    return basis
+
+
+def _flush_ops_warnings(warnings: List[str]) -> None:
+    """
+    Send accumulated operational warnings as ONE Telegram message at the end
+    of the run. Batched deliberately: these are things the operator must act
+    on (stale rows, a cached equity value, an unreadable pending tab) and
+    scattering them between signal messages makes them easy to scroll past.
+
+    Called on every exit path — including early returns from a macro veto or
+    a total risk-validation rejection. A stale-equity warning matters MORE on
+    a no-signal day, because nothing else in the message would reveal it.
+    """
+    if not warnings:
+        return
+    try:
+        tg_mod.send_ops_warnings(warnings)
+    except Exception as e:
+        logger.warning(f"Ops warning delivery failed: {e}")
+
+
+def _safe_float(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# PHASE 2.6 — TWO-STAGE ENTRY (cross-day near-miss state)
+# ============================================================
+
+def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
+    """
+    STAGE 0. Read yesterday's queued signals and resolve each against the
+    session that has since completed.
+
+        low <= ema9_price   -> FILLED    (Stage 1 limit worked, "strict")
+        low <= zone_high    -> FALLBACK  (near-miss -> execute at next open)
+        otherwise           -> EXPIRED
+
+    zone_high = ema9_price + ENTRY2_ATR_TOLERANCE * atr.
+
+    Rows whose signal date has no completed session yet are left PENDING
+    (e.g. a US holiday) rather than being expired — expiring them would
+    silently drop a live setup.
+
+    Fully non-blocking: any failure returns an empty result and the daily
+    pipeline continues. A missed Stage-2 alert is an inconvenience; a
+    blocked pipeline is a lost trading day.
+    """
+    out = {"fallbacks": [], "filled": 0, "expired": 0, "checked": 0, "error": None}
+    try:
+        pending = sheets_mod.read_pending()
+        if pending is None:
+            out["error"] = "pending tab unreadable"
+            logger.warning("Pending entries unreadable — Stage 2 skipped this run.")
+            return out
+        if not pending:
+            return out
+
+        expiry_days = int(getattr(config, "PENDING_ENTRY_EXPIRY_DAYS", 1))
+
+        for row in pending:
+            ticker = str(row.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            out["checked"] += 1
+
+            ema9 = _safe_float(row.get("ema9_price"), 0.0)
+            zone_high = _safe_float(row.get("zone_high"), 0.0)
+            sig_date = str(row.get("signal_date", "")).strip()
+            row_no = row.get("_row")
+
+            df = data_mod.fetch_ohlcv(ticker, period="1mo", interval="1d")
+            if df is None or df.empty or ema9 <= 0:
+                continue
+
+            # Sessions that completed strictly AFTER the signal date.
+            try:
+                after = df[df.index.strftime("%Y-%m-%d") > sig_date]
+            except Exception:
+                after = df.tail(1)
+
+            if len(after) == 0:
+                # No session has traded since the signal (holiday / early run).
+                # Leave PENDING — do not expire a setup that never got a chance.
+                continue
+
+            if len(after) > expiry_days:
+                sheets_mod.update_pending_status(
+                    row_no, "EXPIRED", run_date,
+                    f"{len(after)} sessions elapsed > expiry {expiry_days}"
+                )
+                out["expired"] += 1
+                continue
+
+            bar = after.iloc[0]
+            day_low = float(bar["Low"])
+
+            if day_low <= ema9:
+                sheets_mod.update_pending_status(
+                    row_no, "FILLED", run_date, f"low {day_low:.2f} <= EMA9 {ema9:.2f}"
+                )
+                out["filled"] += 1
+            elif zone_high > 0 and day_low <= zone_high:
+                sheets_mod.update_pending_status(
+                    row_no, "FALLBACK", run_date,
+                    f"near-miss: low {day_low:.2f} in [{ema9:.2f}, {zone_high:.2f}]"
+                )
+                out["fallbacks"].append({
+                    "ticker": ticker,
+                    "ema9_price": ema9,
+                    "zone_high": zone_high,
+                    "day_low": day_low,
+                    "atr": _safe_float(row.get("atr"), 0.0),
+                    "signal_date": sig_date,
+                })
+            else:
+                sheets_mod.update_pending_status(
+                    row_no, "EXPIRED", run_date,
+                    f"low {day_low:.2f} never entered zone (high {zone_high:.2f})"
+                )
+                out["expired"] += 1
+
+        logger.info(
+            f"Pending resolved: {out['filled']} filled, "
+            f"{len(out['fallbacks'])} fallback, {out['expired']} expired "
+            f"(of {out['checked']} checked)"
+        )
+    except Exception as e:
+        out["error"] = str(e)[:200]
+        logger.warning(f"Pending resolution failed (non-blocking): {e}")
+    return out
+
+
+def _queue_pending_entries(signals: List[Dict[str, Any]], run_date: str) -> bool:
+    """
+    STAGE 9. Queue every signal just sent as PENDING so the NEXT run can
+    resolve whether its EMA9 limit filled, near-missed, or expired.
+
+    Queued unconditionally — including signals the operator will end up
+    vetoing. Fill behaviour is a property of the SIGNAL, not of the
+    operator's decision, and mixing the two would contaminate the fill-rate
+    metric that ENTRY2_ATR_TOLERANCE has to be validated against.
+    """
+    rows = []
+    tol = float(getattr(config, "ENTRY2_ATR_TOLERANCE", 0.15))
+    for sig in signals:
+        ind = sig.get("_shadow_indicators", {})
+        ema9 = _safe_float(sig.get("entry"), 0.0)
+        atr = _safe_float(ind.get("atr"), 0.0)
+        if ema9 <= 0:
+            continue
+        rows.append({
+            "signal_date": run_date,
+            "ticker": sig.get("ticker", ""),
+            "ema9_price": round(ema9, 4),
+            "atr": round(atr, 4),
+            "zone_high": round(ema9 + tol * atr, 4),
+            "day_low": "",
+            "status": "PENDING",
+            "execute_date": "",
+            "actual_entry": "",
+            "note": "",
+        })
+    if not rows:
+        return True
+    return sheets_mod.append_pending(rows)
+
+
 def run_daily_signals() -> Dict[str, Any]:
     """
     Main entry point — full daily signal pipeline.
@@ -580,7 +995,49 @@ def run_daily_signals() -> Dict[str, Any]:
         "errors": [],
     }
 
+    ops_warnings: List[str] = []
+
     try:
+        # --------------------------------------------------------
+        # STAGE 0: Resolve yesterday's pending entries (Phase 2.6)
+        #
+        # Runs FIRST, before any macro veto can return early. A near-miss
+        # queued yesterday is already a committed setup — whether TODAY
+        # happens to be a no-signal day is irrelevant to it, and letting a
+        # veto skip this step would silently strand it.
+        # --------------------------------------------------------
+        t = time.time()
+        pending_result = _resolve_pending_entries(run_date)
+        result["stage_timings"]["pending_resolve"] = round(time.time() - t, 2)
+        result["pending"] = {
+            "filled": pending_result.get("filled", 0),
+            "fallback": len(pending_result.get("fallbacks", [])),
+            "expired": pending_result.get("expired", 0),
+        }
+        if pending_result.get("fallbacks"):
+            try:
+                tg_mod.send_stage2_alerts(pending_result["fallbacks"], run_date)
+            except Exception as st2_err:
+                logger.warning(f"Stage 2 alert failed (non-blocking): {st2_err}")
+        if pending_result.get("error"):
+            ops_warnings.append(
+                f"Pending-entry resolution failed: {pending_result['error']}. "
+                f"Two-stage entry is blind this run."
+            )
+
+        # --------------------------------------------------------
+        # STAGE 0b: Resolve running equity (Phase 2.6)
+        #
+        # Done early so a Sheets problem surfaces in the same message as the
+        # signals rather than after them. Never blocks: falls back to cache,
+        # then to starting equity, warning at each level.
+        # --------------------------------------------------------
+        equity_info = _resolve_equity()
+        equity_basis = equity_info["equity"]
+        ops_warnings.extend(equity_info.get("warnings", []))
+        result["equity"] = equity_basis
+        result["equity_source"] = equity_info["source"]
+
         # --------------------------------------------------------
         # STAGE 1: Macro context
         # --------------------------------------------------------
@@ -601,6 +1058,7 @@ def run_daily_signals() -> Dict[str, Any]:
         if not regime["allow_longs"]:
             logger.warning(f"TIER 1 VETO: {regime['reason']}")
             tg_mod.send_no_signal_day(regime["reason"], macro_context)
+            _flush_ops_warnings(ops_warnings)
             result["status"] = "skipped_macro_veto"
             return result
 
@@ -624,7 +1082,12 @@ def run_daily_signals() -> Dict[str, Any]:
         # STAGE 3: Mandatory 5-filter screener + soft RS gap (F7)
         # --------------------------------------------------------
         t = time.time()
-        candidates = run_mandatory_screener(universe_df, regime["regime"])
+        screen_stats: Dict[str, Any] = {}
+        candidates = run_mandatory_screener(
+            universe_df, regime["regime"], stats_out=screen_stats
+        )
+        # Phase 2.6 — LOG ONLY regime context, gates nothing.
+        breadth_pct_above_ema50 = screen_stats.get("pct_above_ema50", "")
         result["stage_timings"]["screener"] = round(time.time() - t, 2)
 
         if not candidates:
@@ -701,6 +1164,30 @@ def run_daily_signals() -> Dict[str, Any]:
             return result
 
         # --------------------------------------------------------
+        # STAGE 5b: Regime + sizing context (Phase 2.6)
+        #
+        # Regime fields are attached to every signal for the shadow log.
+        # LOG ONLY — nothing here gates anything. A regime hard gate was
+        # tested on Batch 3 and rejected (removed the 6 largest winners,
+        # +8.4R, and cut breadth 32 -> 13).
+        #
+        # Sizing is applied BEFORE validation because RULE 4 and RULE 5 now
+        # check against _equity_basis. Pass 1 sizes every signal at the FULL
+        # basis so the budget check is meaningful for each independently;
+        # the cascade is applied in pass 2, after rejects are gone, so a
+        # rejected signal never consumes budget from an approved one.
+        # --------------------------------------------------------
+        spy_price = _safe_float(macro_context.get("spy_price"), 0.0)
+        spy_sma20 = _safe_float(macro_context.get("spy_sma20"), 0.0)
+        spy_vs_sma20 = round((spy_price / spy_sma20 - 1) * 100, 2) if spy_sma20 > 0 else ""
+        for sig in deep_signals:
+            ind = sig.setdefault("_shadow_indicators", {})
+            ind["spy_vs_sma20"] = spy_vs_sma20
+            ind["vix_level"] = macro_context.get("vix", "")
+            ind["pct_above_50dma"] = breadth_pct_above_ema50
+            risk_mod.apply_position_sizing(sig, equity_basis)
+
+        # --------------------------------------------------------
         # STAGE 6: Risk manager validation
         # --------------------------------------------------------
         t = time.time()
@@ -720,14 +1207,33 @@ def run_daily_signals() -> Dict[str, Any]:
             )
             logger.warning(msg)
             tg_mod.send_no_signal_day(msg, macro_context)
+            _flush_ops_warnings(ops_warnings)
             result["status"] = "skipped_risk_validation"
             return result
+
+        # --------------------------------------------------------
+        # STAGE 6b: Waterfall sizing, pass 2 (Phase 2.6)
+        #
+        # Authoritative sizing. Re-runs the cascade over APPROVED signals
+        # only, highest Haiku score first, so budget consumed by a signal
+        # that was later rejected is returned to the pool.
+        # --------------------------------------------------------
+        remaining_basis = _apply_waterfall_sizing(approved, equity_basis)
+        logger.info(
+            f"Waterfall sizing: basis ${equity_basis:.2f} -> ${remaining_basis:.2f} "
+            f"across {len(approved)} signal(s) at "
+            f"{config.MAX_RISK_PER_TRADE_PCT}% each"
+        )
 
         # --------------------------------------------------------
         # STAGE 7: Send to Telegram
         # --------------------------------------------------------
         t = time.time()
-        sent_ok = tg_mod.send_daily_signals(approved, macro_context)
+        sent_ok = tg_mod.send_daily_signals(
+            approved, macro_context,
+            equity_basis=equity_basis,
+            equity_source=equity_info["source"],
+        )
         result["stage_timings"]["telegram_send"] = round(time.time() - t, 2)
         result["signals_sent"] = len(approved) if sent_ok else 0
         result["status"] = "success" if sent_ok else "telegram_failed"
@@ -763,6 +1269,18 @@ def run_daily_signals() -> Dict[str, Any]:
                 logger.warning("Skipping Google Sheets mirror — no shadow rows available")
         except Exception as sheets_err:
             logger.warning(f"Google Sheets mirror failed (non-critical): {sheets_err}")
+
+        # --------------------------------------------------------
+        # STAGE 9: Queue signals for tomorrow's two-stage resolution
+        # (Phase 2.6). Non-blocking, and deliberately last: everything the
+        # operator needs has already been delivered by this point.
+        # --------------------------------------------------------
+        try:
+            _queue_pending_entries(approved, run_date)
+        except Exception as pend_err:
+            logger.warning(f"Pending queue failed (non-blocking): {pend_err}")
+
+        _flush_ops_warnings(ops_warnings)
 
         total = round(time.time() - start_time, 2)
         logger.info(
