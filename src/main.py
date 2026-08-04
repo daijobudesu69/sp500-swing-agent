@@ -363,6 +363,13 @@ def _build_shadow_rows(signals: List[Dict[str, Any]], run_date: str) -> List[Dic
     what a shadow-log row looks like. Add new fields here only.
     """
     rows = []
+    # PHASE 2.6.1: a verification run stamps its own rows as VETOED as they
+    # are written, so they can never reach equity (read_equity() counts only
+    # TAKEN/MODIFIED) and are trivially filterable out of Batch 4 stats.
+    # Doing this here rather than as a manual cleanup step removes the
+    # operator's memory from the loop entirely.
+    verify = bool(getattr(config, "VERIFICATION_RUN", False))
+    veto_reason = getattr(config, "VERIFICATION_VETO_REASON", "") if verify else ""
     for sig in signals:
         ind = sig.get("_shadow_indicators", {})
         rows.append({
@@ -412,8 +419,9 @@ def _build_shadow_rows(signals: List[Dict[str, Any]], run_date: str) -> List[Dic
             # Manual: TAKEN / VETOED / MODIFIED, plus free-text reason.
             # Batch 4 is manually filtered; without these the batch cannot be
             # attributed between system and operator.
-            "_shadow_discretionary_action": "",
-            "_shadow_veto_reason": "",
+            # On a VERIFICATION_RUN both are pre-filled — see config.
+            "_shadow_discretionary_action": "VETOED" if verify else "",
+            "_shadow_veto_reason": veto_reason,
             # Regime context — LOG ONLY, gates nothing.
             "_shadow_spy_vs_sma20": ind.get("spy_vs_sma20", ""),
             "_shadow_vix_level": ind.get("vix_level", ""),
@@ -752,6 +760,19 @@ def _resolve_equity() -> Dict[str, Any]:
                 f"{config.EQUITY_STALE_WARN_DAYS}d: {listed}. "
                 f"Equity is running behind reality until they are filled in."
             )
+        # PHASE 2.6.1: closed rows excluded from equity because the
+        # execution decision was never recorded. This is the warning that
+        # keeps the two-track split honest — silence here would mean either
+        # paper P&L moving real capital, or real P&L going missing, and
+        # neither has any other visible symptom.
+        unmarked = meta.get("unmarked_rows") or []
+        if unmarked:
+            out["warnings"].append(
+                f"{len(unmarked)} CLOSED row(s) have no `discretionary_action`: "
+                f"{', '.join(str(t) for t in unmarked[:5])}. They are EXCLUDED "
+                f"from equity. Mark each TAKEN / MODIFIED / VETOED — if any was "
+                f"really executed, the balance below is understated."
+            )
         return out
 
     cached = _load_equity_cache()
@@ -856,7 +877,8 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
     pipeline continues. A missed Stage-2 alert is an inconvenience; a
     blocked pipeline is a lost trading day.
     """
-    out = {"fallbacks": [], "filled": 0, "expired": 0, "checked": 0, "error": None}
+    out = {"fallbacks": [], "filled": 0, "expired": 0, "checked": 0,
+           "error": None, "shadow_missed": []}
     try:
         pending = sheets_mod.read_pending()
         if pending is None:
@@ -867,6 +889,7 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
             return out
 
         expiry_days = int(getattr(config, "PENDING_ENTRY_EXPIRY_DAYS", 1))
+        shadow_updates = []
 
         for row in pending:
             ticker = str(row.get("ticker", "")).strip().upper()
@@ -876,22 +899,46 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
 
             ema9 = _safe_float(row.get("ema9_price"), 0.0)
             zone_high = _safe_float(row.get("zone_high"), 0.0)
-            sig_date = str(row.get("signal_date", "")).strip()
+            sig_date = str(row.get("signal_date", "")).strip()[:10]
             row_no = row.get("_row")
 
             df = data_mod.fetch_ohlcv(ticker, period="1mo", interval="1d")
             if df is None or df.empty or ema9 <= 0:
                 continue
 
-            # Sessions that completed strictly AFTER the signal date.
+            # ------------------------------------------------------------
+            # PHASE 2.6.1 — OFF-BY-ONE SESSION FIX (was: strictly ">")
+            #
+            # The limit order is live during the session that trades ON the
+            # signal date, not after it. Timeline for a Tuesday run:
+            #
+            #   Tue 01:00 UTC  run -> signal_date = Tue. Limit placed for the
+            #                  Tue US session (13:30-20:00 UTC that same day).
+            #   Tue 20:00 UTC  Tue session closes. yfinance bar index = Tue.
+            #   Wed 01:00 UTC  resolve.
+            #
+            # With ">", Tuesday's own bar was excluded, `after` came back
+            # empty, and the row stayed PENDING. It was then resolved a day
+            # later against WEDNESDAY's bar — a session in which the order
+            # was no longer live. Consequences, all silent:
+            #   - a genuine fill could be recorded EXPIRED (and vice versa)
+            #   - the Stage-2 "execute at next open" alert arrived one
+            #     session late, on a price that had already moved
+            #   - entry_type / fill-rate — the ONLY out-of-sample test of
+            #     ENTRY2_ATR_TOLERANCE = 0.15 — were corrupted from day one
+            #
+            # ">=" includes the signal date's own session, which is the one
+            # the order actually sat in.
+            # ------------------------------------------------------------
             try:
-                after = df[df.index.strftime("%Y-%m-%d") > sig_date]
+                after = df[df.index.strftime("%Y-%m-%d") >= sig_date]
             except Exception:
                 after = df.tail(1)
 
             if len(after) == 0:
-                # No session has traded since the signal (holiday / early run).
-                # Leave PENDING — do not expire a setup that never got a chance.
+                # No session has traded on or since the signal date
+                # (holiday / weekend / early run). Leave PENDING — do not
+                # expire a setup that never got a chance to fill.
                 continue
 
             if len(after) > expiry_days:
@@ -900,20 +947,34 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
                     f"{len(after)} sessions elapsed > expiry {expiry_days}"
                 )
                 out["expired"] += 1
+                shadow_updates.append({
+                    "ticker": ticker, "signal_date": sig_date,
+                    "fields": {"entry_type": "expired", "ema9_filled": "FALSE"},
+                })
                 continue
 
             bar = after.iloc[0]
             day_low = float(bar["Low"])
+            session_date = str(after.index[0].strftime("%Y-%m-%d"))
 
             if day_low <= ema9:
                 sheets_mod.update_pending_status(
-                    row_no, "FILLED", run_date, f"low {day_low:.2f} <= EMA9 {ema9:.2f}"
+                    row_no, "FILLED", run_date,
+                    f"session {session_date}: low {day_low:.2f} <= EMA9 {ema9:.2f}"
                 )
                 out["filled"] += 1
+                # Strict fill: geometry already correct in the shadow log
+                # (entry IS the EMA9 the row was written with). Only the
+                # fill flags need confirming.
+                shadow_updates.append({
+                    "ticker": ticker, "signal_date": sig_date,
+                    "fields": {"entry_type": "strict", "ema9_filled": "TRUE"},
+                })
             elif zone_high > 0 and day_low <= zone_high:
                 sheets_mod.update_pending_status(
                     row_no, "FALLBACK", run_date,
-                    f"near-miss: low {day_low:.2f} in [{ema9:.2f}, {zone_high:.2f}]"
+                    f"session {session_date}: near-miss, low {day_low:.2f} "
+                    f"in [{ema9:.2f}, {zone_high:.2f}] — enter actual_entry"
                 )
                 out["fallbacks"].append({
                     "ticker": ticker,
@@ -923,12 +984,38 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
                     "atr": _safe_float(row.get("atr"), 0.0),
                     "signal_date": sig_date,
                 })
+                # ema9_filled stays FALSE — the LIMIT genuinely did not fill.
+                # entry_type carries "this was traded via Stage 2". Keeping
+                # them separate preserves the project's two-metric split:
+                # fill-rate measures the entry MECHANISM, entry_type measures
+                # the TRADE. Geometry is corrected later by Stage 0c, once
+                # the operator has typed in the real fill price.
+                shadow_updates.append({
+                    "ticker": ticker, "signal_date": sig_date,
+                    "fields": {"entry_type": "fallback", "ema9_filled": "FALSE"},
+                })
             else:
                 sheets_mod.update_pending_status(
                     row_no, "EXPIRED", run_date,
-                    f"low {day_low:.2f} never entered zone (high {zone_high:.2f})"
+                    f"session {session_date}: low {day_low:.2f} never entered "
+                    f"zone (high {zone_high:.2f})"
                 )
                 out["expired"] += 1
+                shadow_updates.append({
+                    "ticker": ticker, "signal_date": sig_date,
+                    "fields": {"entry_type": "expired", "ema9_filled": "FALSE"},
+                })
+
+        # Write the resolved state back into the shadow log. Previously
+        # nothing did this, so _shadow_entry_type was frozen at its
+        # write-time guess of "strict" for every row, forever — including
+        # rows that never filled at all.
+        if shadow_updates:
+            res = sheets_mod.update_shadow_rows(shadow_updates)
+            if res.get("missed"):
+                out["shadow_missed"] = res["missed"]
+            if res.get("error"):
+                logger.warning(f"Shadow entry_type write-back failed: {res['error']}")
 
         logger.info(
             f"Pending resolved: {out['filled']} filled, "
@@ -938,6 +1025,105 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
     except Exception as e:
         out["error"] = str(e)[:200]
         logger.warning(f"Pending resolution failed (non-blocking): {e}")
+    return out
+
+
+def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
+    """
+    STAGE 0c (Phase 2.6.1) — the other half of the Bug 3 fix.
+
+    A Stage-2 trade is entered at MARKET, above EMA9. Its shadow-log row,
+    however, was written at signal time and still carries EMA9-derived
+    entry / stop / TP1 / TP2. Nothing ever corrected them, so:
+
+      - the recorded stop was BELOW the real 1.5xATR stop for that fill,
+        i.e. the row understated the actual risk taken
+      - r_realized computed against those levels was wrong for every
+        fallback trade
+      - Phase 2.6 §3.4 says to "recompute from the actual fill", but no
+        code path existed to get that number back into the log
+
+    The system cannot observe a fill price — execution is manual. So the
+    operator types ONE number into `pending_entries.actual_entry`, and this
+    stage does the arithmetic:
+
+        stop = fill - STOP_ATR_MULT x ATR
+        TP1  = fill + TP1_R_MULT x (fill - stop)
+        TP2  = fill + TP2_R_MULT x (fill - stop)
+
+    IMPORTANT — sizing is NOT touched. risk_per_share = fill - stop
+    = 1.5 x ATR regardless of where the fill lands, so `shares` and
+    `risk_usd` are invariant and 1R is preserved exactly. Only the price
+    levels and the notional shift. This is why the fix is safe to apply
+    after the trade is already open.
+
+    Rows are marked EXECUTED so the same fill is never applied twice.
+    Fully non-blocking.
+    """
+    out = {"applied": 0, "awaiting": 0, "error": None, "missed": []}
+    try:
+        rows = sheets_mod.read_pending(statuses=("FALLBACK",))
+        if rows is None:
+            out["error"] = "pending tab unreadable"
+            return out
+        if not rows:
+            return out
+
+        stop_mult = float(getattr(config, "STOP_ATR_MULT", 1.5))
+        tp1_mult = float(getattr(config, "TP1_R_MULT", 2.0))
+        tp2_mult = float(getattr(config, "TP2_R_MULT", 3.0))
+
+        updates = []
+        for row in rows:
+            ticker = str(row.get("ticker", "")).strip().upper()
+            fill = _safe_float(row.get("actual_entry"), 0.0)
+            atr = _safe_float(row.get("atr"), 0.0)
+            sig_date = str(row.get("signal_date", "")).strip()[:10]
+
+            if fill <= 0 or atr <= 0:
+                # Operator has not entered the fill yet. Leave FALLBACK so
+                # it is picked up on a later run — never expire it, the
+                # trade may well be open.
+                out["awaiting"] += 1
+                continue
+
+            stop = fill - stop_mult * atr
+            risk_per_share = fill - stop
+            if risk_per_share <= 0:
+                out["missed"].append(f"{ticker} (bad geometry)")
+                continue
+
+            updates.append({
+                "ticker": ticker, "signal_date": sig_date,
+                "fields": {
+                    "entry_ema9": round(fill, 4),      # the entry actually used
+                    "stop": round(stop, 4),
+                    "tp1": round(fill + tp1_mult * risk_per_share, 4),
+                    "tp2": round(fill + tp2_mult * risk_per_share, 4),
+                    "entry_type": "fallback",
+                },
+            })
+            sheets_mod.update_pending_status(
+                row["_row"], "EXECUTED", run_date,
+                f"geometry recomputed from fill {fill:.2f} "
+                f"(stop {stop:.2f}, 1R {risk_per_share:.2f})"
+            )
+
+        if updates:
+            res = sheets_mod.update_shadow_rows(updates)
+            out["applied"] = res.get("updated", 0)
+            out["missed"].extend(res.get("missed", []))
+            if res.get("error"):
+                out["error"] = res["error"]
+
+        if out["applied"] or out["awaiting"]:
+            logger.info(
+                f"Fallback geometry: {out['applied']} recomputed, "
+                f"{out['awaiting']} awaiting actual_entry"
+            )
+    except Exception as e:
+        out["error"] = str(e)[:200]
+        logger.warning(f"Fallback geometry step failed (non-blocking): {e}")
     return out
 
 
@@ -986,6 +1172,10 @@ def run_daily_signals() -> Dict[str, Any]:
     logger.info("=" * 60)
     logger.info("DAILY SIGNAL PIPELINE — STARTING")
     logger.info(f"Run timestamp: {run_date}T{datetime.utcnow().strftime('%H:%M:%S')}Z")
+    if getattr(config, "VERIFICATION_RUN", False):
+        logger.warning("*** VERIFICATION RUN *** — every shadow row written by "
+                       "this run is stamped VETOED and excluded from equity. "
+                       "Signals sent are NOT tradable.")
     logger.info("=" * 60)
 
     result = {
@@ -1023,6 +1213,37 @@ def run_daily_signals() -> Dict[str, Any]:
             ops_warnings.append(
                 f"Pending-entry resolution failed: {pending_result['error']}. "
                 f"Two-stage entry is blind this run."
+            )
+        if pending_result.get("shadow_missed"):
+            ops_warnings.append(
+                f"entry_type write-back could not match "
+                f"{len(pending_result['shadow_missed'])} shadow row(s): "
+                f"{', '.join(pending_result['shadow_missed'][:5])}. "
+                f"Those rows still say 'strict' — fix by hand before the "
+                f"entry_type analysis is run."
+            )
+
+        # --------------------------------------------------------
+        # STAGE 0c: Recompute geometry for executed fallback entries
+        # (Phase 2.6.1). Runs right after resolution so a fill typed in
+        # overnight is corrected before anything else reads the log.
+        # --------------------------------------------------------
+        geom_result = _apply_fallback_geometry(run_date)
+        result["fallback_geometry"] = {
+            "applied": geom_result.get("applied", 0),
+            "awaiting": geom_result.get("awaiting", 0),
+        }
+        if geom_result.get("awaiting"):
+            ops_warnings.append(
+                f"{geom_result['awaiting']} fallback trade(s) still have no "
+                f"`actual_entry` in the pending tab. Until you enter the real "
+                f"fill price, their shadow-log stop/TP remain EMA9-based and "
+                f"their r_realized will be WRONG."
+            )
+        if geom_result.get("missed"):
+            ops_warnings.append(
+                f"Fallback geometry could not be written for: "
+                f"{', '.join(geom_result['missed'][:5])}."
             )
 
         # --------------------------------------------------------
