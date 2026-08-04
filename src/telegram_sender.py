@@ -388,6 +388,16 @@ def send_daily_signals(
 
     # Header message
     header = f"{config.SIGNAL_HEADER_EMOJI} *DAILY SIGNALS — {today}*\n\n"
+    # PHASE 2.6.1: a verification run sends REAL messages. Without this
+    # banner they are indistinguishable from tradable signals, and the
+    # whole point of running the check early is that it happens before the
+    # operator is in "execute what Telegram says" mode.
+    if getattr(config, "VERIFICATION_RUN", False):
+        header = (
+            "🧪 *VERIFICATION RUN — DO NOT TRADE*\n"
+            "_Pipeline check only. These rows are logged VETOED and are "
+            "excluded from equity and from Batch 4 statistics._\n\n"
+        ) + header
     header += _format_macro_header(macro) + "\n\n"
     header += f"📤 *{len(signals)} signal(s)* approved\n"
     if equity_basis is not None:
@@ -509,6 +519,13 @@ def send_stage2_alerts(fallbacks: List[Dict[str, Any]], run_date: str) -> bool:
     if not fallbacks:
         return False
 
+    # Phase 2.6.1: read from config rather than restating literals, so the
+    # alert can never drift from what _apply_fallback_geometry() actually
+    # computes. Same lesson as the unwired filter thresholds (2.6 §7.4).
+    stop_mult = float(getattr(config, "STOP_ATR_MULT", 1.5))
+    tp1_mult = float(getattr(config, "TP1_R_MULT", 2.0))
+    tp2_mult = float(getattr(config, "TP2_R_MULT", 3.0))
+
     sep = "──────────────────────────────────────────"
     msg = f"🔁 *STAGE 2 ENTRY — {run_date}*\n"
     msg += "_Yesterday's EMA9 limit missed by a hair. Market on open._\n"
@@ -526,12 +543,36 @@ def send_stage2_alerts(fallbacks: List[Dict[str, Any]], run_date: str) -> bool:
         msg += f"EMA9 limit: `${ema9:.2f}`\n"
         msg += f"Session low: `${low:.2f}` — missed by {miss_atr:.2f}×ATR\n"
         msg += f"Zone was: `${ema9:.2f}` → `${zone_high:.2f}`\n"
-        msg += "➡️ Execute at MARKET on open\n\n"
+        msg += "➡️ Execute at MARKET on open\n"
+
+        # PHASE 2.6.1: show the levels for the WORST fill still inside the
+        # zone. Previously this message gave only formulas, which meant the
+        # operator had to do ATR arithmetic on a phone at the open — and if
+        # they skipped it, the trade ran on EMA9 levels that no longer
+        # matched the fill. Concrete numbers make the correct action the
+        # lazy one. 1R is identical either way (stop travels with the fill),
+        # so these are a floor, not an estimate of the actual fill.
+        if atr > 0:
+            ref = zone_high if zone_high > 0 else ema9
+            stop_ref = ref - stop_mult * atr
+            r_ref = ref - stop_ref
+            msg += (
+                f"_If filled at zone top ${ref:.2f}:_ "
+                f"stop `${stop_ref:.2f}` · TP1 `${ref + tp1_mult * r_ref:.2f}` "
+                f"· TP2 `${ref + tp2_mult * r_ref:.2f}` (1R = ${r_ref:.2f})\n"
+            )
+        msg += "\n"
 
     msg += f"`{sep}`\n"
     msg += "⚠️ *Recompute stop and TP from your ACTUAL fill*, not from EMA9.\n"
-    msg += "Stop = fill − 1.5×ATR | TP1 = fill + 2R | TP2 = fill + 3R\n"
-    msg += "📝 Then enter the fill price in `pending_entries` → `actual_entry`."
+    msg += (
+        f"Stop = fill − {stop_mult}×ATR | "
+        f"TP1 = fill + {tp1_mult:g}R | TP2 = fill + {tp2_mult:g}R\n"
+    )
+    msg += "📌 Share count and risk $ are UNCHANGED — 1R is the same wherever\n"
+    msg += "you fill, because the stop moves with it. Only the levels shift.\n"
+    msg += "📝 Enter the fill price in `pending_entries` → `actual_entry`.\n"
+    msg += "_Next run rewrites the shadow log's stop/TP from it automatically._"
 
     return _send_message(msg)
 
