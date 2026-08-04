@@ -73,6 +73,86 @@ _RR_KEYWORDS = ["rr", "reward", "r:r", "risk:reward", "risk/reward", "2:1", "rat
 # SINGLE-SIGNAL VALIDATION
 # ============================================================
 
+def apply_position_sizing(signal: dict, equity_basis: float) -> dict:
+    """
+    PHASE 2.6 — deterministic position sizing. Call this BEFORE validate_signal().
+
+    This is the fix for the recurring "sizing mismatch" warnings (ADM, URI,
+    JPM, CVS). Those were never an LLM arithmetic problem. Two things caused
+    them:
+
+      1. The Opus prompt gave exactly ONE sizing formula,
+             "Position size = Risk / (Entry - Stop)"
+         which yields SHARES, not dollars — while asking the model to report
+         position_size_usd, shares AND risk_amount_usd as three independent
+         numbers. Three numbers, one formula, no constraint tying them
+         together: they were free to disagree.
+
+      2. At 3% risk the required notional is risk / stop_pct. Stop is
+         1.5 x ATR and F5 floors ATR at 1.5%, so stop could be as tight as
+         2.25% -> notional up to 133% of a $100 account, which RULE 5
+         rejects. RULE 4 and RULE 5 were mutually unsatisfiable for any
+         signal with ATR between 1.5% and 2.0%. There was no correct answer
+         to give.
+
+    Dropping risk to 2% removes (2): stop >= 2.25% > 2.00% always, so the
+    notional cap can never bind. This function removes (1): shares is the
+    single source of truth and the other two are DERIVED from it, so they
+    cannot disagree by construction.
+
+        shares   = risk_usd / (entry - stop)
+        notional = shares * entry
+        risk_usd = shares * (entry - stop)      <- reported, not claimed
+
+    equity_basis is the running balance from main.py's intra-run waterfall:
+    signal 1 sizes off full equity, signal 2 off equity minus signal 1's
+    risk, and so on — so a batch of same-day signals cannot collectively
+    commit more than the risk budget allows.
+
+    Returns the signal (mutated in place) with _sizing_applied=True. Any
+    signal reaching validate_signal() WITHOUT that flag was not sized by
+    this function, which is itself worth knowing.
+    """
+    try:
+        entry = float(signal.get("entry", 0) or 0)
+        stop = float(signal.get("stop_loss", 0) or 0)
+    except (TypeError, ValueError):
+        entry = stop = 0.0
+
+    risk_per_share = entry - stop
+    if entry <= 0 or risk_per_share <= 0:
+        # Malformed geometry — leave untouched and let RULE 1/2 reject it
+        # with the specific error rather than masking it here.
+        signal["_sizing_applied"] = False
+        signal["_equity_basis"] = float(equity_basis)
+        return signal
+
+    risk_budget = float(equity_basis) * (config.MAX_RISK_PER_TRADE_PCT / 100.0)
+
+    # Notional cap at 1x equity (no leverage). With risk at 2% and F5's ATR
+    # floor this is mathematically unreachable, so it exists only as a
+    # guard against a future config change silently re-introducing the
+    # RULE 4 / RULE 5 contradiction described above.
+    shares = risk_budget / risk_per_share
+    max_shares_by_capital = float(equity_basis) / entry
+    risk_capped = shares > max_shares_by_capital
+    if risk_capped:
+        shares = max_shares_by_capital
+        logger.warning(
+            f"  {signal.get('ticker')} notional-capped: stop {risk_per_share/entry*100:.2f}% "
+            f"is tighter than risk {config.MAX_RISK_PER_TRADE_PCT}% — "
+            f"risk reduced below budget. Check ATR floor vs risk %."
+        )
+
+    signal["shares"] = round(shares, 6)
+    signal["position_size_usd"] = round(shares * entry, 2)
+    signal["risk_amount_usd"] = round(shares * risk_per_share, 2)
+    signal["_equity_basis"] = round(float(equity_basis), 4)
+    signal["_risk_capped"] = bool(risk_capped)
+    signal["_sizing_applied"] = True
+    return signal
+
+
 def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
     Validate a single signal against all hard rules.
@@ -195,36 +275,58 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
     # RULE 4: RISK AMOUNT WITHIN BUDGET
     # Budget-vs-claim check remains a HARD gate (unchanged).
     # ============================================================
-    max_risk_usd = config.ACCOUNT_SIZE_USD * (config.MAX_RISK_PER_TRADE_PCT / 100)
+    # PHASE 2.6: the budget is now a % of the CURRENT equity basis passed in
+    # by main.py's waterfall, not a % of a static $100 constant.
+    # _equity_basis falls back to ACCOUNT_START_USD only if sizing was never
+    # applied (e.g. a unit test calling validate_signal directly).
+    equity_basis = float(signal.get("_equity_basis", config.ACCOUNT_START_USD))
+    max_risk_usd = equity_basis * (config.MAX_RISK_PER_TRADE_PCT / 100)
     if risk_amt > max_risk_usd + 0.05:
         violations.append(
             f"Risk ${risk_amt:.2f} exceeds max ${max_risk_usd:.2f} "
-            f"({config.MAX_RISK_PER_TRADE_PCT}% of ${config.ACCOUNT_SIZE_USD})"
+            f"({config.MAX_RISK_PER_TRADE_PCT}% of ${equity_basis:.2f})"
         )
 
-    # Recompute risk to verify Opus math.
-    # CHANGED (sizing-mismatch fix, June 2026): downgraded from hard reject to
-    # soft warning. See module docstring "RULE 4 DESIGN" for rationale.
+    # Recompute risk to verify sizing math.
+    #
+    # PHASE 2.6: RESTORED TO A HARD GATE.
+    # It was downgraded to a soft warning in June 2026 because it kept firing
+    # on valid setups. The real cause was never LLM arithmetic — it was that
+    # RULE 4 (risk = X) and RULE 5 (position <= account) were mutually
+    # unsatisfiable at 3% risk whenever the stop was tighter than 3%, which
+    # F5's 1.5% ATR floor allowed. The model had no consistent answer to give.
+    # Dropping risk to 2% removes that contradiction (see config docstring),
+    # and apply_position_sizing() below now DERIVES risk from shares rather
+    # than letting two independent numbers be reported, so a mismatch is
+    # arithmetically impossible on the normal path. If one appears anyway,
+    # something upstream is genuinely broken and must not reach real capital.
+    #
+    # The June 2026 downgrade note explicitly said to re-litigate this
+    # "if/when position sizing becomes automated or capital is materially
+    # increased". Both are now true.
     if pos_size > 0 and entry > 0:
         actual_risk = pos_size * (risk_per_share / entry)
         if abs(actual_risk - risk_amt) > 0.20:
-            warning = (
-                f"⚠️ Sizing mismatch: Opus claimed ${risk_amt:.2f}, "
-                f"computed ${actual_risk:.2f} — sizing is manual, info only"
+            violations.append(
+                f"Sizing mismatch: reported risk ${risk_amt:.2f} vs "
+                f"computed ${actual_risk:.2f} from position ${pos_size:.2f}"
             )
-            signal["_sizing_warning"] = warning
-            logger.warning(
-                f"  {signal.get('ticker')} sizing mismatch (non-blocking): "
-                f"claimed ${risk_amt:.2f}, computed ${actual_risk:.2f}"
+            logger.error(
+                f"  {signal.get('ticker')} SIZING MISMATCH (hard reject): "
+                f"reported ${risk_amt:.2f}, computed ${actual_risk:.2f}"
             )
 
     # ============================================================
     # RULE 5: POSITION SIZE WITHIN ACCOUNT (1x, no leverage)
     # ============================================================
-    max_position = config.ACCOUNT_SIZE_USD * 1.0
+    # PHASE 2.6: compared against the CURRENT equity basis, not a static
+    # $100. At 2% risk this can never bind (stop >= 2.25% via F5's ATR floor
+    # implies notional <= 88.9% of equity), so it now acts purely as a
+    # tripwire: if it ever fires, an upstream assumption has broken.
+    max_position = equity_basis * 1.0
     if pos_size > max_position + 0.50:
         violations.append(
-            f"Position ${pos_size:.2f} exceeds account ${config.ACCOUNT_SIZE_USD}"
+            f"Position ${pos_size:.2f} exceeds equity ${equity_basis:.2f}"
         )
 
     # ============================================================
@@ -251,7 +353,10 @@ def validate_signal(signal: Dict[str, Any]) -> Tuple[bool, List[str]]:
     # ============================================================
     # RULE 7: HOLDING PERIOD
     # ============================================================
-    max_days = signal.get("max_holding_days", 7)
+    # PHASE 2.6: default was a hard-coded 7 while config said 7 and the
+    # ACTUAL operating rule was 10 TRADING days — and TIME_TP / TIME_SL are
+    # defined at hold >= 10. Config, prompt and this gate now all say 10.
+    max_days = signal.get("max_holding_days", config.MAX_HOLDING_DAYS)
     try:
         max_days = int(max_days)
         if max_days < 1 or max_days > config.MAX_HOLDING_DAYS:
