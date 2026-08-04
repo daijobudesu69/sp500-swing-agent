@@ -117,7 +117,10 @@ NEW COLUMNS IN THIS RELEASE (appended to HEADER, never inserted):
                               all: there is no way to separate "the system
                               is good" from "the operator rescued it".
   _shadow_veto_reason       - free text, e.g. "double top".
-  _shadow_spy_vs_ema20      - regime context, LOG ONLY.
+  _shadow_spy_vs_sma20      - regime context, LOG ONLY. NAMED sma20, not
+                              ema20: fetch_market_context() returns a SIMPLE
+                              moving average. Labelling it EMA would mislead
+                              whoever analyses this column later.
   _shadow_vix_level         - regime context, LOG ONLY.
   _shadow_pct_above_50dma   - regime context, LOG ONLY.
 
@@ -200,7 +203,7 @@ HEADER = [
     "_shadow_force_closed",
     "_shadow_discretionary_action",
     "_shadow_veto_reason",
-    "_shadow_spy_vs_ema20",
+    "_shadow_spy_vs_sma20",
     "_shadow_vix_level",
     "_shadow_pct_above_50dma",
 ]
@@ -216,7 +219,12 @@ PENDING_HEADER = [
     "atr",
     "zone_high",        # ema9_price + ENTRY2_ATR_TOLERANCE * atr
     "day_low",          # session low that entered the zone without filling
-    "status",           # PENDING / EXECUTED / EXPIRED
+    "status",           # PENDING -> resolved next run to one of:
+                        #   FILLED   - session low reached EMA9, limit worked
+                        #   FALLBACK - low entered the tolerance zone but did
+                        #              not fill -> market on next open
+                        #   EXPIRED  - low never entered the zone, or the
+                        #              1-trading-day window elapsed
     "execute_date",     # date the run acted on it
     "actual_entry",     # MANUAL — real fill price achieved at next open
     "note",
