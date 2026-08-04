@@ -75,6 +75,52 @@ NOTE — left intentionally untouched (Phase 2.5):
   config is harmless at zero runtime cost, and removing it risks breaking
   something outside this file's visibility. Safe to clean up later as a
   separate, isolated change if desired.
+
+PHASE 2.6 — BATCH 4 REAL-CAPITAL PREP (August 2026):
+====================================================
+CHANGED:
+  - MAX_RISK_PER_TRADE_PCT: 3.0 -> 2.0
+    Reason (structural, NOT an alpha/filter change): at 3% risk the required
+    notional is risk / stop_pct. Stop = 1.5 x ATR and F5 floors ATR at 1.5%,
+    so stop can be as tight as 2.25% -> notional up to 133% of equity, which
+    risk_manager RULE 5 (position <= account) rejects. Any signal with ATR
+    between 1.5% and 2.0% was therefore mathematically un-sizeable, and that
+    — not LLM arithmetic — is the real root cause of the recurring
+    "sizing mismatch" warnings (ADM, URI, JPM, CVS).
+    At 2% the constraint is stop_pct >= risk_pct -> 1.5 x ATR >= 2.0%
+    -> ATR >= 1.333%. F5's 1.5% floor already guarantees this, so the
+    notional cap can never bind and risk is always exactly 2%.
+    Worst case (ATR 1.5%): notional = 88.9% of equity. Fits.
+    NOTE: this leaves every F1-F7 threshold untouched, so it does NOT
+    violate the Batch 3 "do not change filters" rule (Benjamini-Hochberg
+    0/9). R-multiples are scale-free and unaffected.
+
+  - MAX_HOLDING_DAYS: 7 -> 10
+    Config said 7 for the whole of Batch 3 while the operating rule was
+    10 TRADING days (and TIME_TP / TIME_SL are defined at hold >= 10).
+    risk_manager RULE 7 and the Opus prompt both hard-gate on this value,
+    so they were enforcing a limit nobody was actually trading to.
+    10 trading days ~= 14 calendar days = the stated 2-week max hold.
+
+ADDED:
+  - ACCOUNT_START_USD        — Batch 4 starting equity, the base of the
+    running-equity calculation. ACCOUNT_SIZE_USD is kept as an alias for
+    backwards compatibility (risk_manager reads it) but is now DERIVED and
+    should be treated as "starting equity", not "current equity".
+  - EQUITY_CACHE_PATH        — fallback cache for running equity
+  - EQUITY_STALE_WARN_DAYS   — warn when a row is still outcome-less past this
+  - ENTRY2_ATR_TOLERANCE     — two-stage entry zone width, in ATR units
+  - PENDING_ENTRIES_TAB      — Google Sheets tab holding near-miss state
+  - PENDING_ENTRY_EXPIRY_DAYS— how long a near-miss stays executable
+
+WIRING FIX (silent no-op, found reading the code):
+  - ADX_THRESHOLD / RSI_MIN / VOLUME_RATIO_MIN / ATR_PCT_MIN /
+    EMA_TREND_ANCHOR_PERIOD were defined here but referenced ZERO times
+    outside this file. indicators.py hard-coded 25 / 45 / 1.3 / 1.5 inline,
+    so editing this file changed nothing at all. indicators.py now reads
+    these constants. Any future threshold edit here is now real — which
+    also means the "config freeze" discipline finally applies to a file
+    that actually controls something.
 """
 import os
 from zoneinfo import ZoneInfo
@@ -99,11 +145,41 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ============================================================
 # CAPITAL & RISK MANAGEMENT
 # ============================================================
-ACCOUNT_SIZE_USD = 100.0                # Update manually as portfolio changes
-MAX_RISK_PER_TRADE_PCT = 3.0            # Risk = 3% of current account
+# Batch 4 starting equity. Running equity is computed at runtime as
+#   equity = ACCOUNT_START_USD + sum(r_realized * risk_usd) over CLOSED rows
+# read from the Google Sheet shadow log. Unfilled and FLOAT rows are skipped
+# automatically because they have no outcome. Do NOT edit this mid-batch to
+# "update the balance" — that would double-count realised P&L.
+ACCOUNT_START_USD = 100.0
+
+# Backwards-compatible alias. Several call sites (risk_manager RULE 4/RULE 5)
+# still read ACCOUNT_SIZE_USD. It means STARTING equity, not current equity;
+# current equity comes from the running-equity calculation described above.
+ACCOUNT_SIZE_USD = ACCOUNT_START_USD
+
+# Risk per trade, as a % of CURRENT equity (waterfall within a run:
+# signal 1 sizes off equity, signal 2 off equity minus signal 1's risk, etc).
+# 3.0 -> 2.0 in Phase 2.6 for the structural reason in the module docstring.
+MAX_RISK_PER_TRADE_PCT = 2.0
+
 MIN_RR_RATIO = 2.0                      # Guideline (warning if below, not hard reject)
 BULL_REGIME_RR_TARGET = 3.0             # Stretch target in bull regimes
-MAX_HOLDING_DAYS = 7                    # Max swing duration
+
+# Max swing duration, in TRADING days (~14 calendar days = the 2-week cap).
+# Hard-gated by risk_manager RULE 7 and by the Opus prompt's max_holding_days
+# range — both must stay in sync with this number.
+MAX_HOLDING_DAYS = 10
+
+# ---- Running equity: fallback cache (Phase 2.6) ----
+# main.py computes equity from the Sheet each run and writes the result here.
+# If the Sheets read fails, the cached value is used instead AND a Telegram
+# warning is sent, so a silent fall back to starting equity can never happen.
+EQUITY_CACHE_PATH = ".last_equity"
+
+# Warn (never block) when a shadow-log row still has a blank outcome after
+# this many trading days. A stale row means realised P&L is missing from the
+# equity calculation, so sizing is running off an out-of-date balance.
+EQUITY_STALE_WARN_DAYS = 10
 
 # Direction discipline — STRICT LONG ONLY
 DIRECTION_BIAS = "LONG_ONLY"
@@ -193,6 +269,35 @@ RS_SKIP_RECENT_DAYS = 21                # skip last ~1 month before measuring mo
 # SHADOW LOGGING (Phase 2.3)
 # ============================================================
 SHADOW_LOG_PATH = "shadow_log.csv"
+
+
+# ============================================================
+# TWO-STAGE ENTRY (Phase 2.6)
+# ============================================================
+# Stage 1 (unchanged): limit order at EMA9.
+# Stage 2 (new): if the session low entered [EMA9, EMA9 + tol x ATR] but the
+# limit never filled, the signal is queued as a near-miss and executed at
+# market on the next open. Stop/TP are recomputed from the ACTUAL fill price,
+# not from EMA9, so 1R stays consistent.
+#
+# 0.15 is an IN-SAMPLE fit on 5 observed Batch 3 near-misses
+# (MNST 0.05 / BALL 0.12 / JPM 0.30 / DLTR 0.33 / CAT 0.34, in ATR units).
+# It catches 2 of 5 — chosen deliberately over the 0.35 that catches 5 of 5,
+# to limit entry-price degradation on signals that would have filled normally.
+# PROVISIONAL. Must be re-evaluated OUT-OF-SAMPLE on Batch 4 via the
+# entry_type (strict/fallback) column before it is treated as final.
+ENTRY2_ATR_TOLERANCE = 0.15
+
+# Google Sheets tab holding cross-day near-miss state. Deliberately a plain
+# constant, NOT a new GitHub Secret: the Sheets secrets were once created
+# correctly but never wired into the workflow env block, and the mirror
+# silently no-op'd for 22 days. Fewer secrets, fewer places to forget.
+PENDING_ENTRIES_TAB = "pending_entries"
+
+# A near-miss is executable on the NEXT trading day only. Anything older is
+# marked EXPIRED and never traded — without this, a stale near-miss from
+# weeks ago could fire on an unrelated price.
+PENDING_ENTRY_EXPIRY_DAYS = 1
 
 
 # ============================================================
