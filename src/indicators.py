@@ -228,7 +228,9 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     # === EMAs ===
     ema_9 = float(_ema(close, 9).iloc[-1])
     ema_21 = float(_ema(close, 21).iloc[-1])
-    ema_50 = float(_ema(close, 50).iloc[-1])
+    # PHASE 2.6 WIRING FIX: was hard-coded 50 while config.py defined
+    # EMA_TREND_ANCHOR_PERIOD (referenced nowhere). Default 50 = old value.
+    ema_50 = float(_ema(close, getattr(config, "EMA_TREND_ANCHOR_PERIOD", 50)).iloc[-1])
 
     # === RSI ===
     rsi_14 = float(compute_rsi(close, 14).iloc[-1])
@@ -266,11 +268,23 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     # ============================================================
     # MANDATORY SCREENER (5 filters — ALL must pass)
     # ============================================================
+    # PHASE 2.6 WIRING FIX: these five thresholds were hard-coded here as
+    # 25 / 45 / 1.3 / 1.5 while config.py defined ADX_THRESHOLD, RSI_MIN,
+    # VOLUME_RATIO_MIN and ATR_PCT_MIN that NOTHING outside config.py ever
+    # read. Editing config.py therefore had zero effect — a silent no-op.
+    # getattr(..., default) keeps the exact previous behaviour if a constant
+    # is ever missing, so this change cannot alter Batch 3 semantics:
+    # the defaults below are byte-for-byte the old inline values.
+    adx_min = getattr(config, "ADX_THRESHOLD", 25)
+    rsi_min = getattr(config, "RSI_MIN", 45)
+    vol_min = getattr(config, "VOLUME_RATIO_MIN", 1.3)
+    atr_min = getattr(config, "ATR_PCT_MIN", 1.5)
+
     pass_ema_50 = price > ema_50
-    pass_adx_di = (adx_14 > 25) and (plus_di_val > minus_di_val)
-    pass_rsi = rsi_14 > 45
-    pass_volume = vol_ratio > 1.3
-    pass_atr = atr_pct > 1.5
+    pass_adx_di = (adx_14 > adx_min) and (plus_di_val > minus_di_val)
+    pass_rsi = rsi_14 > rsi_min
+    pass_volume = vol_ratio > vol_min
+    pass_atr = atr_pct > atr_min
 
     # all_pass = F1-F5 only. F6 (pass_ema9_ext) is soft context — never gates here.
     all_pass = all([pass_ema_50, pass_adx_di, pass_rsi, pass_volume, pass_atr])
