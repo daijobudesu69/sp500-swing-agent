@@ -301,6 +301,93 @@ PENDING_ENTRY_EXPIRY_DAYS = 1
 
 
 # ============================================================
+# TRADE GEOMETRY (Phase 2.6.1)
+# ============================================================
+# These mirror the multipliers stated in the Opus prompt (analyst.py):
+#   Stop = Entry - 1.5 x ATR
+#   TP1  = Entry + 2.0 x (Entry - Stop)
+#   TP2  = Entry + 3.0 x (Entry - Stop)
+#
+# They exist here because a Stage-2 (fallback) entry fills ABOVE EMA9, and
+# stop/TP must be recomputed from that ACTUAL fill or the trade carries a
+# wider-than-1R risk wearing a 1R label. Previously these numbers lived only
+# inside a prompt string, so nothing else in the codebase could recompute
+# geometry — the same "defined in one place, needed in two" failure as the
+# unwired filter thresholds found in Phase 2.6 §7.4.
+#
+# NOTE: 1R is INVARIANT to the fill price. risk_per_share = fill - stop
+# = 1.5 x ATR regardless of where the fill lands, so `shares` and `risk_usd`
+# do NOT change on a fallback — only entry / stop / TP1 / TP2 shift up, and
+# the notional rises by at most ENTRY2_ATR_TOLERANCE x ATR x shares.
+STOP_ATR_MULT = 1.5
+TP1_R_MULT = 2.0
+TP2_R_MULT = 3.0
+
+
+# ============================================================
+# EQUITY ATTRIBUTION (Phase 2.6.1)
+# ============================================================
+# Batch 4 runs TWO tracks on one shadow log (Phase 2.6 §2.6):
+#   - statistical track: EVERY signal is logged and outcome-tracked at full n
+#   - execution track:   only the signals the operator actually executed
+#
+# Equity is REAL CAPITAL and must only ever move on the execution track.
+# Without this filter, read_equity() summed r_realized x risk_usd across
+# every closed row — so the paper P&L of a VETOED trade would silently move
+# the real account balance, and the next run's 2% sizing would be computed
+# off a number that does not exist in any brokerage account.
+#
+# A row contributes to equity ONLY if discretionary_action is in this set.
+# MODIFIED counts because the trade was taken; if its size differed from the
+# system's, correct it by editing that row's risk_usd, not by excluding it.
+EQUITY_COUNTED_ACTIONS = ("TAKEN", "MODIFIED")
+
+# Actions that mean "logged for statistics, never bought". Excluded from
+# equity silently and without warning — this is the expected steady state.
+EQUITY_EXCLUDED_ACTIONS = ("VETOED", "SKIPPED", "NOT_TAKEN")
+
+# What to do with a CLOSED row that has r_realized + risk_usd but a BLANK
+# discretionary_action. It is genuinely ambiguous: it could be an executed
+# trade the operator forgot to annotate, or a paper row.
+#
+# False (default) = exclude it and raise a Telegram warning.
+# Deliberately the opposite default to entry_diagnostic.get_taken(), which
+# treats blank as TAKEN. That asymmetry is intentional, not an inconsistency:
+# a diagnostic that drops rows loses sample; an equity figure that invents
+# capital mis-sizes real money. When in doubt, the report guesses and the
+# bank account does not.
+EQUITY_COUNT_UNMARKED = False
+
+
+# ============================================================
+# VERIFICATION RUN (Phase 2.6.1)
+# ============================================================
+# A pre-Batch-4 pipeline check is a REAL run: it spends API budget, sends
+# real Telegram messages, and writes real rows to the shadow log and the
+# pending tab. Those rows are dated BEFORE the batch window and were never
+# traded, so they must never reach either track:
+#   - equity  (they are not real capital)
+#   - Batch 4 statistics (they are outside the batch window)
+#
+# Set VERIFICATION_RUN=true in the workflow env to have main.py stamp every
+# row it writes as VETOED at write time.
+#
+# WHY AT WRITE TIME, not by cleaning up afterwards: the cleanup depends on
+# the operator remembering to do it. This repo already has one 22-day
+# silent failure caused by exactly that class of dependency (the Sheets
+# secrets that were created but never wired). A flag that tags rows as they
+# are written cannot be forgotten — the worst case is a run that was NOT a
+# verification being tagged, which is visible and reversible, rather than a
+# verification run silently contaminating real equity, which is neither.
+VERIFICATION_RUN = os.getenv("VERIFICATION_RUN", "").strip().lower() in ("1", "true", "yes")
+
+# Written into veto_reason. Deliberately greppable and self-explanatory —
+# a future session reading the sheet must be able to tell in one glance why
+# a cluster of rows is vetoed on a date outside every batch window.
+VERIFICATION_VETO_REASON = "VERIFICATION_RUN — pre-Batch-4 pipeline check, never traded"
+
+
+# ============================================================
 # BLACK SWAN MARKERS (Phase 2.5)
 # ============================================================
 # Type A dedup — main.py reads this before alerting; writes the run date
