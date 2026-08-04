@@ -3,6 +3,15 @@ on:
   schedule:
     - cron: '0 1 * * 2-6'
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Bypass the Batch 4 start guard (pre-launch verification only)'
+        type: boolean
+        default: false
+      verification:
+        description: 'Stamp every shadow row VETOED — excluded from equity and Batch 4 stats'
+        type: boolean
+        default: true
 jobs:
   run-daily-pipeline:
     runs-on: ubuntu-latest
@@ -27,17 +36,39 @@ jobs:
           # freeze is needed later, re-add a CUTOFF_EPOCH block here rather
           # than editing this one.
           #
-          # workflow_dispatch still respects this guard. To force an early
-          # manual run, temporarily set START_EPOCH to a past instant.
+          # PHASE 2.6.1 — the pre-launch check no longer requires editing
+          # START_EPOCH. Use Run workflow -> force_run = true instead.
+          # Editing a date constant means committing it twice and REMEMBERING
+          # to revert; if the revert is forgotten the guard is silently dead
+          # forever, with no symptom until an unwanted run costs money. A
+          # dispatch input cannot be left switched on — it defaults back to
+          # false the moment the run ends. Same class of fix as stamping
+          # verification rows at write time rather than cleaning up after.
           START_EPOCH=$(date -u -d "2026-08-11T00:00:00Z" +%s)
           NOW_EPOCH=$(date -u +%s)
-          if [ "$NOW_EPOCH" -lt "$START_EPOCH" ]; then
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            echo "🔓 force_run=true — start guard bypassed (manual dispatch)."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$NOW_EPOCH" -lt "$START_EPOCH" ]; then
             echo "⏸️  Before Batch 4 start (2026-08-11 00:00 UTC). Skipping — no API calls."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
             echo "✅ Batch 4 active. Proceeding with pipeline."
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Guard against an untagged pre-launch run
+        if: steps.startgate.outputs.should_run == 'true' && inputs.force_run == true && inputs.verification != true
+        run: |
+          # force_run bypasses the date guard, so this run writes rows that
+          # look exactly like Batch 4 rows but sit outside the batch window.
+          # Allowing that untagged is how a batch quietly acquires trades it
+          # never made. If a genuinely tradable early run is ever wanted,
+          # remove this step deliberately — do not switch verification off
+          # by habit.
+          echo "::error::force_run=true with verification=false would write UNTAGGED"
+          echo "::error::rows outside the Batch 4 window. Re-run with verification=true."
+          exit 1
 
       - name: Checkout repository
         if: steps.startgate.outputs.should_run == 'true'
@@ -63,11 +94,12 @@ jobs:
           GSHEET_SA_JSON: ${{ secrets.GSHEET_SA_JSON }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSHEET_TAB: ${{ secrets.GSHEET_TAB }}
+          VERIFICATION_RUN: ${{ inputs.verification }}
           PYTHONUNBUFFERED: '1'
         run: |
           python -m src.main --mode daily
       - name: Commit equity cache if changed
-        if: steps.startgate.outputs.should_run == 'true'
+        if: steps.startgate.outputs.should_run == 'true' && inputs.verification != true
         continue-on-error: true
         run: |
           # Phase 2.6: main.py writes .last_equity after a successful Sheets
