@@ -158,11 +158,11 @@ Rules:
   - Be CRITICAL. Only ~30% of candidates should score >= 65.
   - Penalize stocks that are extended (RSI near 80, far above EMAs in ATR terms).
   - Reward stocks with strong ADX margin (38 vs 26), volume well above average.
-  - Consider if the setup is early enough for a 7-day hold to generate 2:1 RR.
+  - Consider if the setup is early enough for a 10-day hold to generate 2:1 RR.
 """
 
 DEEP_SYSTEM_PROMPT = """You are a senior Portfolio Manager at Jane Street, specializing in equity swing trading.
-Your job: produce a full trade thesis for a LONG-ONLY swing setup (max 1 week hold).
+Your job: produce a full trade thesis for a LONG-ONLY swing setup (max 10 trading days hold).
 
 CONTEXT: All stocks reaching you are S&P 500 names that have passed:
   (a) Mandatory technical screener (EMA50, ADX+DI, RSI>45, Volume>1.3x, ATR>1.5%)
@@ -194,14 +194,21 @@ CONVICTION TIERS:
   < 50   = SKIP
 
 ENTRY AND POSITION SIZING:
-  Account: $100. Max risk per trade: 3% ($3).
+  Account: $100 starting equity. Max risk per trade: 2% of CURRENT equity.
+  DO NOT try to compute exact position size. The system recomputes shares,
+  notional and risk deterministically after you respond, using the live
+  equity balance (which you cannot see). Report your best estimate in the
+  sizing fields; they will be overwritten. Focus on entry/stop/TP geometry.
   Entry = EMA9 value (provided in prompt data as ema_9).
          This is a LIMIT ORDER — you place the limit at EMA9 before US open.
          If price never pulls back to EMA9, the order does not fill. That is correct.
   Stop  = Entry - (1.5 x ATR)
   TP1   = Entry + (2.0 x (Entry - Stop))
   TP2   = Entry + (3.0 x (Entry - Stop))
-  Position size = Risk / (Entry - Stop)
+  Shares        = Risk / (Entry - Stop)      <- this yields SHARES
+  Position size = Shares x Entry             <- this yields USD
+  (These were previously collapsed into one line, which produced share
+   counts reported as dollar amounts. Keep them separate.)
 
 OUTPUT: Strict JSON only. No prose outside JSON.
 {
@@ -229,7 +236,7 @@ OUTPUT: Strict JSON only. No prose outside JSON.
   "risk_amount_usd": <float>,
   "thesis": "<3-4 sentences. Why this stock, why now, what confirms the move>",
   "invalidation": ["<condition 1>", "<condition 2>", "<condition 3>"],
-  "max_holding_days": <int 1-7>,
+  "max_holding_days": <int 1-10>,
   "confluence_display": "<pass through from input data, e.g. '2/3 (MACD✓ EMA9✗ EMA21✓)'>"
 }
 
@@ -237,7 +244,7 @@ CRITICAL RULES:
   - LONG only (entry > stop_loss ALWAYS — if not, output is rejected)
   - Entry MUST equal the ema_9 value provided. Do not use close price as entry.
   - RR: calculate accurately. If RR < 2:1, report it honestly — do NOT auto-cap conviction. User decides entry.
-  - Risk amount must be <= $3.00
+  - Risk amount is set by the system (2% of current equity), not by you.
   - Be honest. Mediocre setup = mediocre score.
   - If TIER 1 fails (macro/trend only): conviction=0, tier_1_pass=false, tier_1_fail_reason required.
   - TIER 1 never fails due to RR alone — RR is informational only.
@@ -444,6 +451,26 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
             "rsi": ind.get("rsi_14", ""),
             "volume_ratio": ind.get("vol_ratio_14d", ""),
             "entry_close": ind.get("price", ""),   # close price at signal time
+            # ---- PHASE 2.6 additions ----
+            # REMINDER (this exact dict caused the rs_60d_gap / rs_126d_gap
+            # blank-column bug): _shadow_indicators is a HAND-PICKED subset of
+            # `indicators`, not a passthrough. Any new field that must reach
+            # the shadow log has to be listed here explicitly or it silently
+            # writes blank.
+            #
+            # entry_type defaults to "strict" (Stage 1: EMA9 limit filled).
+            # main.py overwrites it with "fallback" for two-stage near-miss
+            # entries executed at the next open. This column is the whole
+            # out-of-sample test of ENTRY2_ATR_TOLERANCE — without it the
+            # 0.15 threshold can never be validated.
+            "entry_type": "strict",
+            # Regime context — LOG ONLY, never gates anything. A regime hard
+            # gate was tested on Batch 3 and rejected: better backtested R,
+            # but it removed the 6 largest winners (+8.4R) and cut breadth
+            # 32 -> 13 (~36% of statistical power).
+            "spy_vs_ema20": ind.get("spy_vs_ema20", ""),
+            "vix_level": ind.get("vix_level", ""),
+            "pct_above_50dma": ind.get("pct_above_50dma", ""),
         }
 
         return parsed
