@@ -388,6 +388,28 @@ VERIFICATION_VETO_REASON = "VERIFICATION_RUN — pre-Batch-4 pipeline check, nev
 
 
 # ============================================================
+# DATA QUALITY FLOORS (Phase 2.6.1)
+# ============================================================
+# Minimum number of tickers that must return usable OHLCV data before the
+# screener's breadth figure is treated as a market reading at all.
+#
+# Observed 4 Aug 2026, same session, two runs:
+#   14:45 UTC (US market open) ->  75/503 fetched, breadth "58.67%"
+#   23:12 UTC (US market shut) -> 501/503 fetched, breadth "71.66%"
+#
+# yfinance rate limiting during US market hours silently removed 85% of the
+# universe. Breadth is a RATIO, so it still produced a clean-looking number
+# from the 15% that survived. That number feeds pct_above_50dma, one of the
+# three regime columns Edge B depends on.
+#
+# 400/503 ~= 80% coverage. Below that, breadth is written BLANK so the day
+# is visibly excludable from regime analysis instead of silently corrupting
+# it. Tune only with evidence about what coverage actually distorts breadth
+# — this is a guard, not a tuned parameter.
+MIN_SCREENED_FOR_BREADTH = 400
+
+
+# ============================================================
 # BLACK SWAN MARKERS (Phase 2.5)
 # ============================================================
 # Type A dedup — main.py reads this before alerting; writes the run date
