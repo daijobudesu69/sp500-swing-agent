@@ -459,32 +459,95 @@ def read_equity():
     IMPORTANT (Batch 3 -> Batch 4 boundary): legacy rows have no risk_usd,
     so they contribute nothing and equity starts from ACCOUNT_START_USD.
     That is intentional — Batch 3 was paper, its P&L is not real capital.
+
+    PHASE 2.6.1 — EXECUTION-TRACK FILTER (bug fix):
+    ------------------------------------------------
+    Batch 4 runs two tracks on ONE sheet (Phase 2.6 §2.6): every signal is
+    logged for statistics at full n, but only a subset is actually bought
+    (~7/month at 2% risk on $100). This function previously summed EVERY
+    closed row, so the paper P&L of a VETOED trade moved the REAL account
+    balance — and the next run sized 2% off a number that existed in no
+    brokerage account.
+
+    That is the same class of defect as the RULE 4 / RULE 5 conflict fixed
+    in Phase 2.6: two design decisions (#3 "equity = realised only" and #13
+    "shadow log records everything") that cannot both be true in one code
+    path. Resolved the same way — by making the code say which one wins.
+
+    A row now contributes ONLY if discretionary_action is in
+    config.EQUITY_COUNTED_ACTIONS. Blank actions are excluded and WARNED
+    about (config.EQUITY_COUNT_UNMARKED), because a blank is genuinely
+    ambiguous and an equity number that quietly invents capital is worse
+    than one that visibly lags.
     """
-    meta = {"closed_rows": 0, "skipped_no_risk": 0, "stale_rows": [], "source": "sheets"}
+    meta = {
+        "closed_rows": 0,
+        "skipped_no_risk": 0,
+        "stale_rows": [],
+        "vetoed_rows": 0,
+        "unmarked_rows": [],
+        "source": "sheets",
+    }
     rows = read_shadow_rows()
     if rows is None:
         return None, meta
     if not rows:
         return float(config.ACCOUNT_START_USD), meta
 
-    if "risk_usd" not in {k for r in rows for k in r.keys()}:
+    present_cols = {k for r in rows for k in r.keys()}
+
+    if "risk_usd" not in present_cols:
         # The migration has not been applied. Refuse to guess.
         print("[sheets_logger] ERROR: no 'risk_usd' column found — sheet migration not applied.")
         meta["error"] = "missing_risk_usd_column"
         return None, meta
 
+    if "discretionary_action" not in present_cols:
+        # Same migration, same refusal. Without this column every paper row
+        # is indistinguishable from an executed one, and equity cannot be
+        # computed correctly at all — only plausibly. Fail loudly instead:
+        # main.py falls back to the cached value and warns the operator.
+        print("[sheets_logger] ERROR: no 'discretionary_action' column found — "
+              "sheet migration not applied. Equity cannot separate executed "
+              "trades from paper ones.")
+        meta["error"] = "missing_discretionary_action_column"
+        return None, meta
+
     equity = float(config.ACCOUNT_START_USD)
     stale_after = int(getattr(config, "EQUITY_STALE_WARN_DAYS", 10))
+    counted = {a.upper() for a in getattr(config, "EQUITY_COUNTED_ACTIONS", ("TAKEN", "MODIFIED"))}
+    excluded = {a.upper() for a in getattr(config, "EQUITY_EXCLUDED_ACTIONS", ("VETOED",))}
+    count_unmarked = bool(getattr(config, "EQUITY_COUNT_UNMARKED", False))
 
     for r in rows:
         r_real = _to_float(r.get("r_realized"))
         risk = _to_float(r.get("risk_usd"))
         outcome = str(r.get("outcome", "")).strip()
         hold = _to_float(r.get("hold_days"))
+        ticker = r.get("ticker", "?")
+
+        # Normalise the action the same way header names are normalised, so
+        # "Vetoed", " vetoed ", "not-taken" all resolve. Anything not
+        # recognised is treated as unmarked, never as executed.
+        action = re.sub(r"[^A-Z0-9]+", "_", str(r.get("discretionary_action", "")).upper()).strip("_")
 
         if r_real is not None and risk is not None:
-            equity += r_real * risk
-            meta["closed_rows"] += 1
+            if action in counted:
+                equity += r_real * risk
+                meta["closed_rows"] += 1
+            elif action in excluded:
+                # Paper row on the statistical track. Expected — no warning.
+                meta["vetoed_rows"] += 1
+            elif not action:
+                if count_unmarked:
+                    equity += r_real * risk
+                    meta["closed_rows"] += 1
+                else:
+                    meta["unmarked_rows"].append(ticker)
+            else:
+                # Recognised as neither. Do NOT guess — a typo'd action must
+                # not be allowed to move real capital.
+                meta["unmarked_rows"].append(f"{ticker}({action})")
             continue
 
         if r_real is not None and risk is None:
@@ -495,7 +558,7 @@ def read_equity():
         # Not closed. Flag if it has been open suspiciously long — a stale
         # row means realised P&L is missing and sizing runs off an old base.
         if not outcome and hold is not None and hold > stale_after:
-            meta["stale_rows"].append((r.get("ticker", "?"), hold))
+            meta["stale_rows"].append((ticker, hold))
 
     return round(equity, 4), meta
 
@@ -504,14 +567,20 @@ def read_equity():
 # PHASE 2.6 — PENDING ENTRIES (two-stage entry, cross-day state)
 # ============================================================
 
-def read_pending():
+def read_pending(statuses=("PENDING",)):
     """
-    Return PENDING near-miss rows as list of dicts, each including
-    "_row" = the 1-based sheet row number (needed to write status back).
+    Return near-miss rows matching `statuses` as list of dicts, each
+    including "_row" = the 1-based sheet row number (needed to write back).
 
     Returns None on failure — caller must NOT treat that as "nothing
     pending", or a committed near-miss would be silently dropped.
+
+    PHASE 2.6.1: `statuses` was previously hard-coded to PENDING. Stage 0c
+    needs to re-read FALLBACK rows to pick up the hand-entered actual_entry
+    price, which is the only way the recomputed stop/TP ever reaches the
+    shadow log.
     """
+    wanted = {str(s).strip().upper() for s in statuses}
     try:
         ws = _worksheet(tab=config.PENDING_ENTRIES_TAB, header=PENDING_HEADER)
         if ws is None:
@@ -524,13 +593,104 @@ def read_pending():
         out = []
         for idx, raw_row in enumerate(values[1:], start=2):
             row = {k: c for k, c in zip(head, raw_row) if k}
-            if str(row.get("status", "")).strip().upper() == "PENDING":
+            if str(row.get("status", "")).strip().upper() in wanted:
                 row["_row"] = idx
                 out.append(row)
         return out
     except Exception as e:
         print(f"[sheets_logger] pending read failed: {e}")
         return None
+
+
+def update_shadow_rows(updates):
+    """
+    PHASE 2.6.1 — write specific fields back into existing shadow_log rows.
+
+    This module was WRITE-ONLY at the row level: append_shadow_rows() could
+    create a row, but nothing could ever amend one. That is why
+    `_shadow_entry_type` was frozen at its write-time guess of "strict"
+    forever, and why a Stage-2 fallback trade kept EMA9-derived stop/TP in
+    the log while being executed at a different price. The column said
+    "strict", the geometry said EMA9, and the trade was neither.
+
+    updates: list of dicts
+        {"ticker": "AAPL", "signal_date": "2026-08-11",
+         "fields": {"entry_type": "fallback", "stop": 123.45, ...}}
+
+    Field keys are NORMALISED names (i.e. "entry_type", not
+    "_shadow_entry_type") so they match whatever naming convention the live
+    header actually uses — the sheet mixes three of them (Phase 2.6 §7.3).
+
+    Matches on (ticker, date). If a pair is ambiguous or absent the row is
+    reported in the return value and NOT written — a wrong-row write would
+    corrupt a real trade's geometry, which is strictly worse than a missing
+    annotation.
+
+    Returns {"updated": int, "missed": [str], "error": str|None}.
+    Never raises.
+    """
+    out = {"updated": 0, "missed": [], "error": None}
+    if not updates:
+        return out
+    try:
+        ws = _worksheet()
+        if ws is None:
+            out["error"] = "not configured"
+            return out
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            out["error"] = "shadow log empty"
+            return out
+
+        head = [_normalize(h) for h in values[0]]
+        col_of = {name: i for i, name in enumerate(head) if name}
+
+        if "ticker" not in col_of or "date" not in col_of:
+            out["error"] = "shadow log missing ticker/date column"
+            return out
+
+        t_idx, d_idx = col_of["ticker"], col_of["date"]
+
+        # (ticker, date) -> [row numbers]. Built once for all updates.
+        index = {}
+        for row_no, raw in enumerate(values[1:], start=2):
+            if len(raw) <= max(t_idx, d_idx):
+                continue
+            key = (str(raw[t_idx]).strip().upper(), str(raw[d_idx]).strip()[:10])
+            index.setdefault(key, []).append(row_no)
+
+        cells = []
+        for upd in updates:
+            ticker = str(upd.get("ticker", "")).strip().upper()
+            sig_date = str(upd.get("signal_date", "")).strip()[:10]
+            fields = upd.get("fields") or {}
+            matches = index.get((ticker, sig_date), [])
+
+            if len(matches) != 1:
+                out["missed"].append(
+                    f"{ticker}@{sig_date}"
+                    f"{' (no row)' if not matches else f' ({len(matches)} rows)'}"
+                )
+                continue
+
+            row_no = matches[0]
+            for key, val in fields.items():
+                key_n = _normalize(key)
+                if key_n not in col_of:
+                    out["missed"].append(f"{ticker}@{sig_date} (no column '{key_n}')")
+                    continue
+                cells.append(gspread.Cell(row_no, col_of[key_n] + 1, val))
+            out["updated"] += 1
+
+        if cells:
+            ws.update_cells(cells, value_input_option="USER_ENTERED")
+            print(f"[sheets_logger] amended {out['updated']} shadow row(s), "
+                  f"{len(cells)} cell(s).")
+        return out
+    except Exception as e:
+        out["error"] = str(e)[:200]
+        print(f"[sheets_logger] shadow row update failed (non-blocking): {e}")
+        return out
 
 
 def append_pending(rows):
