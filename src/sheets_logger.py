@@ -228,6 +228,22 @@ PENDING_HEADER = [
     "execute_date",     # date the run acted on it
     "actual_entry",     # MANUAL — real fill price achieved at next open
     "note",
+    # PHASE 2.6.1 — date of the last COMPLETED session the signal was
+    # computed from. Appended last, so existing 10-column pending tabs keep
+    # working: rows written before this column existed simply leave it blank
+    # and the resolver falls back to the old signal_date behaviour.
+    #
+    # Why this exists: `signal_date` is the wall-clock UTC date of the run,
+    # which is NOT reliably the session the limit order sits in.
+    #   01:00 UTC run (production cron): last bar = D-1, order lives in D,
+    #                                    signal_date = D          -> order in signal_date's session
+    #   23:12 UTC run (off-schedule):    last bar = D,   order lives in D+1,
+    #                                    signal_date = D          -> order in the session AFTER
+    # Same column, two different meanings, depending only on what time the
+    # workflow happened to fire. Anchoring on the bar date removes the
+    # ambiguity entirely: the order is always live in the first session
+    # STRICTLY AFTER bar_date, at any run time.
+    "bar_date",
 ]
 
 
