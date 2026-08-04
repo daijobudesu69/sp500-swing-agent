@@ -640,15 +640,70 @@ def run_mandatory_screener(
     if errors > 0:
         logger.warning(f"Screener completed with {errors} fetch errors")
 
-    breadth = round(above_ema50 / screened_ok * 100, 2) if screened_ok else ""
+    # ------------------------------------------------------------------
+    # PHASE 2.6.1 — BREADTH COVERAGE GUARD
+    #
+    # breadth feeds `pct_above_50dma` (see STAGE 5, ind[...] assignment),
+    # one of the three regime columns Edge B (regime-scaled risk) is built
+    # on. It is a RATIO, so it always produces a plausible-looking number
+    # no matter how few tickers survived the fetch — and that is exactly
+    # the failure mode observed on 4 Aug 2026:
+    #
+    #   14:45 UTC run -> 58.67% breadth, computed from  75 tickers
+    #   23:12 UTC run -> 71.66% breadth, computed from 501 tickers
+    #
+    # Same market, same session, 13 points apart. The 58.67% was not a
+    # market reading at all — it was an artefact of a biased 15% sample
+    # that yfinance rate limiting happened to leave behind. Nothing in the
+    # log flagged it, because a ratio of a small sample looks identical to
+    # a ratio of a large one.
+    #
+    # A regime column that is silently wrong on degraded-fetch days is
+    # worse than one that is missing: the analysis cannot tell the two
+    # apart, and Batch 4 would mix real regime readings with artefacts.
+    # So below the coverage floor, breadth is written BLANK. The gap is
+    # then visible in the data and those days can be excluded from regime
+    # analysis rather than quietly poisoning it.
+    #
+    # Same principle as _to_float() refusing to guess at "1,25" and
+    # read_equity() refusing to run without discretionary_action: surface
+    # the gap, never invent the number.
+    # ------------------------------------------------------------------
+    min_screened = int(getattr(config, "MIN_SCREENED_FOR_BREADTH", 400))
+    coverage_pct = round(screened_ok / total * 100, 1) if total else 0.0
+
+    if screened_ok >= min_screened:
+        breadth = round(above_ema50 / screened_ok * 100, 2)
+        breadth_valid = True
+    else:
+        breadth = ""          # deliberately blank — see rationale above
+        breadth_valid = False
+
     if stats_out is not None:
         stats_out["pct_above_ema50"] = breadth
         stats_out["screened_ok"] = screened_ok
+        stats_out["screened_total"] = total
+        stats_out["coverage_pct"] = coverage_pct
+        stats_out["breadth_valid"] = breadth_valid
 
-    logger.info(
-        f"Mandatory screener: {len(candidates)} candidates from {total} universe "
-        f"| breadth above EMA50: {breadth}% of {screened_ok} screened"
-    )
+    if breadth_valid:
+        logger.info(
+            f"Mandatory screener: {len(candidates)} candidates from {total} universe "
+            f"| breadth above EMA50: {breadth}% of {screened_ok} screened "
+            f"({coverage_pct}% coverage)"
+        )
+    else:
+        # Loud, at WARNING — the 4 Aug 14:45 run logged its 75/503 at INFO
+        # inside a routine line and nobody noticed until the log was read
+        # by hand days later.
+        logger.warning(
+            f"DEGRADED FETCH COVERAGE: only {screened_ok}/{total} tickers "
+            f"({coverage_pct}%) returned usable data — below the "
+            f"{min_screened} floor. Breadth SUPPRESSED (logged blank) "
+            f"because a ratio of this sample is not a market reading. "
+            f"Candidate count ({len(candidates)}) is also unreliable: the "
+            f"screener only saw part of the universe."
+        )
     return candidates
 
 
@@ -907,31 +962,32 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
                 continue
 
             # ------------------------------------------------------------
-            # PHASE 2.6.1 — OFF-BY-ONE SESSION FIX (was: strictly ">")
+            # PHASE 2.6.1 — SESSION SELECTION
             #
-            # The limit order is live during the session that trades ON the
-            # signal date, not after it. Timeline for a Tuesday run:
+            # The order is live in the first session STRICTLY AFTER the last
+            # completed bar the signal was computed from. Anchoring on that
+            # bar (`bar_date`) makes this correct at any run time:
             #
-            #   Tue 01:00 UTC  run -> signal_date = Tue. Limit placed for the
-            #                  Tue US session (13:30-20:00 UTC that same day).
-            #   Tue 20:00 UTC  Tue session closes. yfinance bar index = Tue.
-            #   Wed 01:00 UTC  resolve.
+            #   01:00 UTC run: last bar = Mon -> order live Tue -> > Mon = Tue
+            #   23:12 UTC run: last bar = Tue -> order live Wed -> > Tue = Wed
             #
-            # With ">", Tuesday's own bar was excluded, `after` came back
-            # empty, and the row stayed PENDING. It was then resolved a day
-            # later against WEDNESDAY's bar — a session in which the order
-            # was no longer live. Consequences, all silent:
-            #   - a genuine fill could be recorded EXPIRED (and vice versa)
-            #   - the Stage-2 "execute at next open" alert arrived one
-            #     session late, on a price that had already moved
-            #   - entry_type / fill-rate — the ONLY out-of-sample test of
-            #     ENTRY2_ATR_TOLERANCE = 0.15 — were corrupted from day one
+            # The original code anchored on `signal_date` (wall-clock UTC
+            # date) with ">", which skipped the correct session on the 01:00
+            # cron and resolved a day late against a session the order was
+            # never live in. Switching that to ">=" fixed the 01:00 case but
+            # broke any off-schedule run — the anchor was the real defect,
+            # not the operator. bar_date fixes both at once.
             #
-            # ">=" includes the signal date's own session, which is the one
-            # the order actually sat in.
+            # LEGACY FALLBACK: rows queued before bar_date existed have it
+            # blank. For those, keep the ">= signal_date" behaviour, which is
+            # correct for the 01:00 UTC scheduled run they were written by.
             # ------------------------------------------------------------
+            bar_date = str(row.get("bar_date", "")).strip()[:10]
             try:
-                after = df[df.index.strftime("%Y-%m-%d") >= sig_date]
+                if bar_date:
+                    after = df[df.index.strftime("%Y-%m-%d") > bar_date]
+                else:
+                    after = df[df.index.strftime("%Y-%m-%d") >= sig_date]
             except Exception:
                 after = df.tail(1)
 
@@ -1139,6 +1195,30 @@ def _queue_pending_entries(signals: List[Dict[str, Any]], run_date: str) -> bool
     """
     rows = []
     tol = float(getattr(config, "ENTRY2_ATR_TOLERANCE", 0.15))
+
+    # PHASE 2.6.1 — anchor on the DATA, not the wall clock. One extra fetch
+    # of SPY gives the last completed session for the whole market, which is
+    # the same for every ticker queued this run. The limit order is live in
+    # the first session strictly AFTER this date, regardless of what time
+    # the workflow fired. See PENDING_HEADER["bar_date"] for the full
+    # rationale and the two timing cases it resolves.
+    bar_date = ""
+    try:
+        spy_df = data_mod.fetch_ohlcv("SPY", period="5d", interval="1d")
+        if spy_df is not None and not spy_df.empty:
+            bar_date = str(spy_df.index[-1].strftime("%Y-%m-%d"))
+    except Exception as e:
+        logger.warning(f"Could not determine bar_date for pending rows: {e}")
+
+    if not bar_date:
+        # Fall back to legacy behaviour rather than blocking the queue, but
+        # say so — resolution will be less precise for these rows.
+        logger.warning(
+            "bar_date unavailable — pending rows will be resolved using the "
+            "legacy run_date anchor, which is only correct for the 01:00 UTC "
+            "scheduled run."
+        )
+
     for sig in signals:
         ind = sig.get("_shadow_indicators", {})
         ema9 = _safe_float(sig.get("entry"), 0.0)
@@ -1156,6 +1236,7 @@ def _queue_pending_entries(signals: List[Dict[str, Any]], run_date: str) -> bool
             "execute_date": "",
             "actual_entry": "",
             "note": "",
+            "bar_date": bar_date,
         })
     if not rows:
         return True
@@ -1311,10 +1392,35 @@ def run_daily_signals() -> Dict[str, Any]:
         breadth_pct_above_ema50 = screen_stats.get("pct_above_ema50", "")
         result["stage_timings"]["screener"] = round(time.time() - t, 2)
 
+        # PHASE 2.6.1 — carry fetch coverage into the result payload and the
+        # Telegram ops block. On 4 Aug the 75/503 coverage was buried in a
+        # routine INFO line and went unnoticed for days; it needs to be
+        # somewhere the operator actually looks.
+        result["fetch_coverage"] = {
+            "screened_ok": screen_stats.get("screened_ok", 0),
+            "total": screen_stats.get("screened_total", 0),
+            "coverage_pct": screen_stats.get("coverage_pct", 0.0),
+            "breadth_valid": screen_stats.get("breadth_valid", False),
+        }
+        if not screen_stats.get("breadth_valid", False):
+            ops_warnings.append(
+                f"DEGRADED FETCH: only {screen_stats.get('screened_ok', 0)}/"
+                f"{screen_stats.get('screened_total', 0)} tickers returned data "
+                f"({screen_stats.get('coverage_pct', 0)}%). Breadth logged BLANK "
+                f"— this day must be EXCLUDED from regime analysis. Signals "
+                f"below come from a partial universe; treat the candidate list "
+                f"as incomplete, not as 'the market had nothing better'."
+            )
+
         if not candidates:
             msg = "No stocks passed mandatory 5-filter screener"
             logger.warning(msg)
             tg_mod.send_no_signal_day(msg, macro_context)
+            # PHASE 2.6.1: this early return previously discarded every
+            # accumulated ops warning. A no-candidate day caused by degraded
+            # fetch coverage is exactly when the operator most needs to know
+            # WHY there were no candidates.
+            _flush_ops_warnings(ops_warnings)
             result["status"] = "skipped_no_candidates"
             return result
 
@@ -1346,6 +1452,7 @@ def run_daily_signals() -> Dict[str, Any]:
             )
             logger.warning(msg)
             tg_mod.send_no_signal_day(msg, macro_context)
+            _flush_ops_warnings(ops_warnings)   # PHASE 2.6.1 — see above
             result["status"] = "skipped_low_haiku_scores"
             return result
 
@@ -1381,6 +1488,7 @@ def run_daily_signals() -> Dict[str, Any]:
             msg = "All Opus deep analyses failed"
             logger.warning(msg)
             tg_mod.send_no_signal_day(msg, macro_context)
+            _flush_ops_warnings(ops_warnings)   # PHASE 2.6.1 — see above
             result["status"] = "opus_all_failed"
             return result
 
