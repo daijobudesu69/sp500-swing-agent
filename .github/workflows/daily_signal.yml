@@ -8,40 +8,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Batch 3 cutoff guard
-        id: cutoff
+      - name: Batch 4 start guard
+        id: startgate
         run: |
-          # Batch 3 freeze — no new signal generation on/after this instant.
-          # Sunday 2026-07-26 01:00 US Eastern (EDT, UTC-4) = 2026-07-26 05:00 UTC.
-          # Last allowed run: Sat 2026-07-25 01:00 UTC (08:00 WIB), based on
-          # Friday 2026-07-24 US close. Everything from Tue 2026-07-28 onward
-          # (and every week after) is auto-skipped — zero API calls, zero cost.
-          CUTOFF_EPOCH=$(date -u -d "2026-07-26T05:00:00Z" +%s)
+          # PHASE 2.6 / BATCH 4 (Aug 2026)
+          # ------------------------------------------------------------------
+          # The Batch 3 CUTOFF guard (blocked everything on/after
+          # 2026-07-26T05:00:00Z) has been REMOVED. It is replaced by a START
+          # guard so the pipeline stays dormant — zero API calls, zero cost —
+          # until Batch 4 formally begins.
+          #
+          # Batch 4 start: first run Tue 2026-08-11 01:00 UTC (08:00 WIB),
+          # which analyses the Mon 2026-08-10 US close. Note 2026-08-10 is a
+          # Monday and this cron only fires Tue-Sat, so Monday itself has no
+          # scheduled run — Tuesday morning WIB is the first one that covers it.
+          #
+          # NO END CUTOFF. Per decision #5, Batch 4 runs open-endedly. If a
+          # freeze is needed later, re-add a CUTOFF_EPOCH block here rather
+          # than editing this one.
+          #
+          # workflow_dispatch still respects this guard. To force an early
+          # manual run, temporarily set START_EPOCH to a past instant.
+          START_EPOCH=$(date -u -d "2026-08-11T00:00:00Z" +%s)
           NOW_EPOCH=$(date -u +%s)
-          if [ "$NOW_EPOCH" -ge "$CUTOFF_EPOCH" ]; then
-            echo "🛑 Batch 3 cutoff reached (2026-07-26 05:00 UTC). Skipping pipeline — no API calls."
+          if [ "$NOW_EPOCH" -lt "$START_EPOCH" ]; then
+            echo "⏸️  Before Batch 4 start (2026-08-11 00:00 UTC). Skipping — no API calls."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "✅ Before cutoff. Proceeding with pipeline."
+            echo "✅ Batch 4 active. Proceeding with pipeline."
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout repository
-        if: steps.cutoff.outputs.should_run == 'true'
+        if: steps.startgate.outputs.should_run == 'true'
         uses: actions/checkout@v6
       - name: Setup Python 3.11
-        if: steps.cutoff.outputs.should_run == 'true'
+        if: steps.startgate.outputs.should_run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
       - name: Install dependencies
-        if: steps.cutoff.outputs.should_run == 'true'
+        if: steps.startgate.outputs.should_run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run daily signal pipeline
-        if: steps.cutoff.outputs.should_run == 'true'
+        if: steps.startgate.outputs.should_run == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
@@ -53,6 +66,24 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: |
           python -m src.main --mode daily
+      - name: Commit equity cache if changed
+        if: steps.startgate.outputs.should_run == 'true'
+        continue-on-error: true
+        run: |
+          # Phase 2.6: main.py writes .last_equity after a successful Sheets
+          # equity read. Persisting it back to the repo is what makes the
+          # fallback cache survive between runs (each run is a fresh checkout).
+          # continue-on-error: a failed commit must never fail the pipeline —
+          # signals were already sent by this point.
+          if [ -n "$(git status --porcelain .last_equity)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .last_equity
+            git commit -m "chore: update equity cache [skip ci]"
+            git push
+          else
+            echo "No equity cache change to commit."
+          fi
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
