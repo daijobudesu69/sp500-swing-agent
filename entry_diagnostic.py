@@ -105,6 +105,89 @@ load_shadow_log() now detects and skips both via _is_blank_row() and
 _is_header_artifact_row(), printing a one-line summary of how many rows
 were skipped and why. This is cleanup for stale exports only, not a
 defense against anything the current sheets_logger.py can still produce.
+
+PHASE 2.6 — BATCH 4 COLUMNS + NEW ANALYSES (August 2026):
+==========================================================
+Batch 4 is the first real-money batch. Five columns were added to the
+shadow log, and this script would have silently ignored every one of
+them — the same failure mode that made rs_60d_gap/rs_126d_gap
+uncollectable for a whole phase. All five are now read.
+
+ADDED TO _CANONICAL_FIELDS AND THE COERCION LISTS:
+  _shadow_risk_usd              float — dollar risk at entry
+  _shadow_entry_type            str   — "strict" | "fallback"
+  _shadow_force_closed          bool  — closed by batch cutoff, not by rule
+  _shadow_discretionary_action  str   — TAKEN | VETOED | MODIFIED
+  _shadow_veto_reason           str   — free text
+  _shadow_spy_vs_sma20          float — regime context, LOG ONLY
+  _shadow_vix_level             float — regime context, LOG ONLY
+  _shadow_pct_above_50dma       float — regime context, LOG ONLY
+
+ALSO READ (manual / formula columns, written by hand in the Sheet and
+never by main.py — so they appear in a Sheet export but not in a CSV
+written directly by the pipeline):
+  _shadow_mfe_price, _shadow_mfe_r, _shadow_days_to_mfe,
+  _shadow_fill_date, _shadow_exit_date
+
+NEW SECTION — MFE GIVE-BACK QUADRANTS (the most important one):
+  Batch 3 could not answer the single question that decides what to fix
+  next: did losing and TIME_TP trades never go anywhere, or did they go
+  up and then hand it all back? Those two diagnoses call for OPPOSITE
+  fixes — one is a selection problem (change what you buy), the other is
+  an exit problem (change when you sell) — and without MFE there is no
+  way to tell them apart. Phase 2.1 could tell (12 of 13 losers never
+  reached +1R); Batch 3 could not, because the column did not exist.
+
+  give_back = mfe_r - r_realized, then split by days_to_mfe:
+    mfe >= 2.0R                -> TP1 was TAGGED. If the outcome is not
+                                  TP1_TRAIL/TP2, that is an EXECUTION bug,
+                                  not a strategy result.
+    1.0-2.0R, peak early (<=5) -> rose, peaked, gave it back -> exit is
+                                  too late
+    1.0-2.0R, peak late  (>=8) -> still rising when the hold cut it off ->
+                                  hold is too short
+    < 1.0R                     -> never went anywhere -> SELECTION problem;
+                                  changing the hold period cannot help
+
+  Quadrant boundaries (2.0R, day 5) are drawn from just two annotated
+  Batch 3 cases (NTAP mfe 2.00 @ day 5 -> 0.73R; URI 1.63 @ day 5 ->
+  0.66R). They are provisional starting lines, not established thresholds.
+
+NEW SECTION — ENTRY TYPE (strict vs fallback):
+  The out-of-sample test of ENTRY2_ATR_TOLERANCE = 0.15, which was fitted
+  in-sample on 5 Batch 3 near-misses and catches 2 of them. Reports win
+  rate and avg R for each entry type. Do NOT retune the tolerance from
+  this batch's own numbers — that is the in-sample fit that a
+  Benjamini-Hochberg pass on Batch 3 already showed 0/9 hypotheses
+  surviving. Treat any signal here as a hypothesis for the NEXT batch.
+
+NEW SECTION — DISCRETIONARY ATTRIBUTION:
+  Batch 4 is manually filtered, so "how did the system do" and "how did
+  the operator do" are two different questions and mixing them makes both
+  unanswerable. TAKEN rows measure the executed strategy; VETOED rows,
+  scored against what actually happened, measure whether the operator's
+  judgement adds anything. Consistently vetoing losers would be evidence
+  worth trying to encode as a filter; vetoing winners is worth knowing
+  even sooner.
+
+NEW SECTION — DOLLAR RECONCILIATION:
+  With floating 2% risk, R is no longer convertible to dollars by a single
+  multiplier. Sums r_realized * risk_usd per row to reconstruct realised
+  P&L and reconcile it against ACCOUNT_START_USD, so a mismatch against
+  the broker balance surfaces here rather than being discovered later.
+  Also counts closed rows MISSING risk_usd — those are invisible to the
+  equity calculation in sheets_logger.read_equity(), and therefore
+  silently mis-size every subsequent trade.
+
+NEW FLAG — --exclude-vetoed:
+  Restricts every analysis to discretionary_action == TAKEN.
+
+FORCE-CLOSED HANDLING:
+  Rows with force_closed TRUE were ended by an administrative batch cutoff
+  rather than by their own stop/target/time rule. They are still real
+  closed trades and stay in the totals, but they are counted and reported
+  separately — a batch ending mid-trade truncates outcomes in a direction
+  that has nothing to do with the strategy.
 """
 import argparse
 import csv
@@ -130,6 +213,21 @@ LOSS_OUTCOMES = {"SL", "INVALIDATED_LOSS", "TIME_SL"}
 CLOSED_OUTCOMES = WIN_OUTCOMES | LOSS_OUTCOMES   # everything except FLOAT / blank
 OPEN_OUTCOMES = {"FLOAT"}
 
+# Phase 2.6 — discretionary attribution (Batch 4 is manually filtered)
+TAKEN_ACTIONS = {"TAKEN", "MODIFIED"}   # MODIFIED = taken with an adjustment
+VETOED_ACTIONS = {"VETOED"}
+
+# Phase 2.6 — MFE give-back quadrant boundaries.
+# PROVISIONAL. Derived from exactly two annotated Batch 3 cases
+# (NTAP mfe 2.00R @ day 5 -> 0.73R; URI 1.63R @ day 5 -> 0.66R).
+# Two observations do not establish a threshold — these are starting
+# lines for reading the distribution, and should be redrawn once a real
+# distribution of mfe_r / days_to_mfe exists.
+MFE_TP1_TAGGED_R = 2.0      # at/above this, TP1 was reachable
+MFE_WENT_NOWHERE_R = 1.0    # below this, the trade never moved
+MFE_PEAK_EARLY_DAY = 5      # peak on/before this day = early
+MFE_PEAK_LATE_DAY = 8       # peak on/after this day = still rising at cutoff
+
 # Canonical field list (the underscore-prefixed form every function in
 # this file expects). Used by _normalize_fieldnames() to map a header
 # WITHOUT the leading underscore back to its canonical name.
@@ -142,9 +240,36 @@ _CANONICAL_FIELDS = [
     "_shadow_volume_ratio", "_shadow_entry_close", "_shadow_entry_ema9",
     "_shadow_stop", "_shadow_tp1", "_shadow_tp2", "_shadow_rr",
     "_shadow_ema9_filled", "_shadow_outcome", "_shadow_r_realized", "_shadow_hold_days",
+    # ---- Phase 2.6: written by main.py ----
+    "_shadow_risk_usd", "_shadow_entry_type", "_shadow_force_closed",
+    "_shadow_discretionary_action", "_shadow_veto_reason",
+    "_shadow_spy_vs_sma20", "_shadow_vix_level", "_shadow_pct_above_50dma",
+    # ---- Phase 2.6: manual / formula columns, Sheet-only ----
+    # Never written by main.py, so absent from a pipeline-written CSV but
+    # present in a Sheet export. Listed here so normalisation maps them
+    # from the no-underscore Sheet form, and so _is_header_artifact_row()
+    # recognises them if one ever lands in a data-row position.
+    "_shadow_fill_date", "_shadow_exit_date",
+    "_shadow_mfe_price", "_shadow_mfe_r", "_shadow_days_to_mfe",
 ]
 # Map "shadow_date" -> "_shadow_date", etc. — built once at import time.
 _NO_UNDERSCORE_TO_CANONICAL = {f.lstrip("_"): f for f in _CANONICAL_FIELDS}
+
+# PHASE 2.6 — third naming convention: BARE names.
+# The manual / formula columns are added to the Sheet by hand and carry no
+# prefix at all — the header cell literally reads "mfe_r", "days_to_mfe",
+# "fill_date". They are not "shadow_mfe_r", so neither map above matches
+# them, and every one was being read as an unknown pass-through column:
+# the MFE section reported "no mfe_r data" on a sheet that had it.
+#
+# Restricted to the manual columns ON PURPOSE. Applying bare mapping to
+# every canonical field would make a plain "date" or "stop" column collide
+# with "_shadow_date" / "_shadow_stop". Narrow map, no collisions.
+_MANUAL_BARE_FIELDS = [
+    "_shadow_fill_date", "_shadow_exit_date",
+    "_shadow_mfe_price", "_shadow_mfe_r", "_shadow_days_to_mfe",
+]
+_BARE_TO_CANONICAL = {f.replace("_shadow_", ""): f for f in _MANUAL_BARE_FIELDS}
 
 
 # ============================================================
@@ -168,6 +293,13 @@ def _normalize_fieldnames(row: Dict[str, str]) -> Dict[str, str]:
             out[key] = value                              # already canonical
         elif key in _NO_UNDERSCORE_TO_CANONICAL:
             out[_NO_UNDERSCORE_TO_CANONICAL[key]] = value  # strip-form -> canonical
+        elif str(key).strip().lower() in _BARE_TO_CANONICAL:
+            # Phase 2.6: bare manual column ("mfe_r" -> "_shadow_mfe_r").
+            # Guarded so an explicit canonical value already present is
+            # never overwritten by a bare duplicate.
+            canon = _BARE_TO_CANONICAL[str(key).strip().lower()]
+            if canon not in out or str(out.get(canon, "")).strip() == "":
+                out[canon] = value
         else:
             out[key] = value                               # unknown column, pass through
     return out
@@ -277,9 +409,18 @@ def _coerce_row(row: Dict[str, str]) -> Dict[str, Any]:
         "_shadow_rsi", "_shadow_volume_ratio", "_shadow_entry_close",
         "_shadow_entry_ema9", "_shadow_stop", "_shadow_tp1", "_shadow_tp2",
         "_shadow_rr", "_shadow_r_realized",
+        # ---- Phase 2.6 ----
+        # Without these the columns are read as raw strings and every
+        # numeric comparison against them silently fails — the exact
+        # failure that made rs_60d/rs_126d unusable for a whole phase.
+        "_shadow_risk_usd",
+        "_shadow_spy_vs_sma20", "_shadow_vix_level", "_shadow_pct_above_50dma",
+        "_shadow_mfe_price", "_shadow_mfe_r",
     ]
-    int_fields = ["_shadow_confluence_count", "_shadow_hold_days"]
-    bool_fields = ["_shadow_ema9_filled"]
+    int_fields = ["_shadow_confluence_count", "_shadow_hold_days",
+                  "_shadow_days_to_mfe"]          # Phase 2.6
+    bool_fields = ["_shadow_ema9_filled",
+                   "_shadow_force_closed"]        # Phase 2.6
 
     out = dict(row)
 
@@ -772,6 +913,377 @@ def print_data_quality_note(rows: List[Dict[str, Any]]) -> None:
 # MAIN
 # ============================================================
 
+# ============================================================
+# PHASE 2.6 — ANALYSES
+# ============================================================
+
+def _action(row: Dict[str, Any]) -> str:
+    return str(row.get("_shadow_discretionary_action", "") or "").strip().upper()
+
+
+def _entry_type(row: Dict[str, Any]) -> str:
+    return str(row.get("_shadow_entry_type", "") or "").strip().lower()
+
+
+def get_taken(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Rows the operator actually executed.
+
+    A BLANK action counts as TAKEN. Rationale: blank is the default state
+    of a fresh row, and treating it as "not taken" would drop most of the
+    batch on the first day someone forgets to annotate. A veto is a
+    deliberate act and must be recorded deliberately.
+    """
+    return [r for r in rows if _action(r) not in VETOED_ACTIONS]
+
+
+def analyse_entry_type(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Strict (EMA9 limit filled) vs fallback (two-stage near-miss executed at
+    the next open). This is the out-of-sample test of
+    ENTRY2_ATR_TOLERANCE = 0.15.
+
+    Batch 3 motivation: unfilled EMA9 orders went on to reach TP1 at a
+    significantly higher rate than filled ones (Fisher exact p ~ 0.007 on
+    8/8). The limit was filling on weakness and missing the strongest
+    continuations. If that holds, fallback entries should show a BETTER
+    win rate than strict ones despite the worse entry price.
+
+    Do NOT retune the tolerance from these numbers — same batch, same fit.
+    """
+    out = {"strict": {"n": 0, "wins": 0, "r_sum": 0.0},
+           "fallback": {"n": 0, "wins": 0, "r_sum": 0.0},
+           "unknown": {"n": 0, "wins": 0, "r_sum": 0.0}}
+    for row in closed:
+        et = _entry_type(row)
+        bucket = out.get(et, out["unknown"])
+        r = row.get("_shadow_r_realized")
+        bucket["n"] += 1
+        if is_win(row):
+            bucket["wins"] += 1
+        if r is not None:
+            bucket["r_sum"] += float(r)
+    for k, b in out.items():
+        b["win_rate"] = (b["wins"] / b["n"] * 100) if b["n"] else None
+        b["avg_r"] = (b["r_sum"] / b["n"]) if b["n"] else None
+    return out
+
+
+def analyse_mfe_giveback(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    The section Batch 3 could not produce, and the one that decides what
+    gets fixed next.
+
+    give_back = mfe_r - r_realized. Split by how far the trade actually
+    travelled and when it peaked:
+
+      tp1_tagged     mfe >= 2.0R. TP1 was reachable. If the outcome is not
+                     TP1_TRAIL/TP2, this is an EXECUTION failure — the
+                     order was not placed or did not trigger — not a
+                     strategy result. NTAP in Batch 3 (mfe exactly 2.00R,
+                     outcome TIME_TP) is the known example.
+      peaked_early   1.0-2.0R, peak on/before day 5. Rose, then handed it
+                     back. The exit is too late.
+      peaked_late    1.0-2.0R, peak on/after day 8. Still rising when the
+                     hold limit cut it off. The hold is too short.
+      went_nowhere   mfe < 1.0R. Never moved. This is a SELECTION problem,
+                     and no change to hold period or trailing rule can fix
+                     it. In Phase 2.1 this described 12 of 13 losers.
+
+    If went_nowhere dominates, do not touch the exit logic — the answer is
+    upstream in what gets bought.
+    """
+    buckets = {"tp1_tagged": [], "peaked_early": [], "peaked_late": [],
+               "peaked_mid": [], "went_nowhere": []}
+    missing = 0
+    for row in closed:
+        mfe = row.get("_shadow_mfe_r")
+        if mfe is None:
+            missing += 1
+            continue
+        day = row.get("_shadow_days_to_mfe")
+        r = row.get("_shadow_r_realized")
+        entry = {
+            "ticker": row.get("_shadow_ticker", "?"),
+            "outcome": _outcome(row),
+            "mfe_r": float(mfe),
+            "r": float(r) if r is not None else None,
+            "day": day,
+            "give_back": (float(mfe) - float(r)) if r is not None else None,
+        }
+        if float(mfe) >= MFE_TP1_TAGGED_R:
+            buckets["tp1_tagged"].append(entry)
+        elif float(mfe) < MFE_WENT_NOWHERE_R:
+            buckets["went_nowhere"].append(entry)
+        elif day is not None and day <= MFE_PEAK_EARLY_DAY:
+            buckets["peaked_early"].append(entry)
+        elif day is not None and day >= MFE_PEAK_LATE_DAY:
+            buckets["peaked_late"].append(entry)
+        else:
+            buckets["peaked_mid"].append(entry)
+
+    # Execution bug detector: TP1 was reachable but the outcome says it
+    # was never tagged. This is the one finding here that is actionable
+    # immediately, without waiting for a larger sample.
+    exec_bugs = [e for e in buckets["tp1_tagged"]
+                 if e["outcome"] not in {"TP1_TRAIL", "TP2"}]
+    return {"buckets": buckets, "missing_mfe": missing, "exec_bugs": exec_bugs,
+            "n_with_mfe": sum(len(v) for v in buckets.values())}
+
+
+def analyse_discretionary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Score the operator's manual filtering against what actually happened.
+
+    Batch 4 is manually filtered, so a single blended number cannot
+    distinguish "the system picked well" from "the operator removed the
+    bad ones". Splitting them makes both answerable:
+
+      TAKEN  -> the strategy as actually executed
+      VETOED -> the operator's judgement, scored against the outcome the
+                trade would have had
+
+    A vetoed row only carries information if its outcome was recorded
+    ANYWAY (i.e. tracked on paper after being skipped). Vetoed rows with
+    no outcome are counted but cannot be scored — and are worth chasing,
+    because they are precisely where the operator's edge would show up.
+    """
+    taken, vetoed, vetoed_scored = [], [], []
+    for row in rows:
+        act = _action(row)
+        if act in VETOED_ACTIONS:
+            vetoed.append(row)
+            if is_closed(row):
+                vetoed_scored.append(row)
+        else:
+            taken.append(row)
+
+    def _summ(rs):
+        cl = [r for r in rs if is_closed(r)]
+        wins = [r for r in cl if is_win(r)]
+        rvals = [float(r["_shadow_r_realized"]) for r in cl
+                 if r.get("_shadow_r_realized") is not None]
+        return {
+            "n": len(rs), "closed": len(cl), "wins": len(wins),
+            "win_rate": (len(wins) / len(cl) * 100) if cl else None,
+            "avg_r": (sum(rvals) / len(rvals)) if rvals else None,
+            "total_r": sum(rvals) if rvals else 0.0,
+        }
+
+    reasons: Dict[str, int] = {}
+    for row in vetoed:
+        reason = str(row.get("_shadow_veto_reason", "") or "").strip() or "(no reason given)"
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    return {"taken": _summ(taken), "vetoed": _summ(vetoed),
+            "vetoed_unscored": len(vetoed) - len(vetoed_scored),
+            "reasons": reasons}
+
+
+def analyse_dollars(closed: List[Dict[str, Any]], start_equity: float = 100.0) -> Dict[str, Any]:
+    """
+    Reconstruct realised P&L in dollars.
+
+    With floating 2% risk there is no single R-to-dollar multiplier any
+    more: each row must be converted with its OWN risk_usd. This mirrors
+    exactly what sheets_logger.read_equity() does, so a disagreement
+    between this number and the broker balance points at the data, not at
+    the arithmetic.
+
+    missing_risk counts closed rows with an r_realized but no risk_usd.
+    Those rows are INVISIBLE to the equity calculation — every trade sized
+    after them uses a balance that is wrong by their P&L, silently.
+    """
+    total = 0.0
+    counted = 0
+    missing_risk = []
+    for row in closed:
+        r = row.get("_shadow_r_realized")
+        risk = row.get("_shadow_risk_usd")
+        if r is None:
+            continue
+        if risk is None:
+            missing_risk.append(row.get("_shadow_ticker", "?"))
+            continue
+        total += float(r) * float(risk)
+        counted += 1
+    return {"realized_usd": total, "counted": counted,
+            "missing_risk": missing_risk,
+            "start_equity": start_equity,
+            "end_equity": start_equity + total,
+            "return_pct": (total / start_equity * 100) if start_equity else None}
+
+
+def analyse_force_closed(closed: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Separate trades ended by an administrative batch cutoff from those that
+    ended by their own rule.
+
+    Force-closed trades are real and stay in the totals, but their outcome
+    was truncated by the calendar rather than by the strategy — so a batch
+    that ends mid-position distorts the distribution in a way that has
+    nothing to do with edge.
+    """
+    forced = [r for r in closed if r.get("_shadow_force_closed") is True]
+    natural = [r for r in closed if r.get("_shadow_force_closed") is not True]
+
+    def _summ(rs):
+        rvals = [float(r["_shadow_r_realized"]) for r in rs
+                 if r.get("_shadow_r_realized") is not None]
+        wins = [r for r in rs if is_win(r)]
+        return {"n": len(rs), "wins": len(wins),
+                "win_rate": (len(wins) / len(rs) * 100) if rs else None,
+                "avg_r": (sum(rvals) / len(rvals)) if rvals else None}
+
+    return {"forced": _summ(forced), "natural": _summ(natural)}
+
+
+# ============================================================
+# PHASE 2.6 — PRINTERS
+# ============================================================
+
+def print_entry_type_section(a: Dict[str, Any]) -> None:
+    print(f"\n{DIVIDER}")
+    print("  ENTRY TYPE — strict vs fallback (two-stage entry)")
+    print(f"{DIVIDER}")
+    print(f"  {'type':<12}{'n':>5}{'wins':>7}{'win %':>9}{'avg R':>9}")
+    for key in ("strict", "fallback", "unknown"):
+        b = a[key]
+        if b["n"] == 0:
+            continue
+        print(f"  {key:<12}{b['n']:>5}{b['wins']:>7}"
+              f"{_pct(b['win_rate']):>9}{_r(b['avg_r']):>9}")
+    if a["fallback"]["n"] == 0:
+        print("\n  No fallback entries yet — ENTRY2_ATR_TOLERANCE untested.")
+    elif a["fallback"]["n"] < 5:
+        print(f"\n  Only {a['fallback']['n']} fallback entries — far too few to")
+        print("  judge the 0.15 tolerance. Read as direction, not evidence.")
+    print("\n  NOTE: 0.15 was fitted in-sample on 5 Batch 3 near-misses.")
+    print("  Do not retune it from this batch's own numbers.")
+
+
+def print_mfe_section(a: Dict[str, Any]) -> None:
+    print(f"\n{DIVIDER}")
+    print("  MFE GIVE-BACK — selection problem or exit problem?")
+    print(f"{DIVIDER}")
+    if a["n_with_mfe"] == 0:
+        print(f"  No mfe_r data ({a['missing_mfe']} closed rows missing it).")
+        print("  This is the single highest-value column in the log — it is the")
+        print("  only way to tell 'never went anywhere' (fix selection) apart")
+        print("  from 'went up then gave it back' (fix the exit). Batch 3 could")
+        print("  not answer that question at all. Fill mfe_r and days_to_mfe.")
+        return
+
+    labels = {
+        "tp1_tagged":   f"TP1 tagged (mfe >= {MFE_TP1_TAGGED_R}R)",
+        "peaked_early": f"Peaked early (<= day {MFE_PEAK_EARLY_DAY}) -> exit too late",
+        "peaked_mid":   "Peaked mid-hold",
+        "peaked_late":  f"Peaked late (>= day {MFE_PEAK_LATE_DAY}) -> hold too short",
+        "went_nowhere": f"Never moved (mfe < {MFE_WENT_NOWHERE_R}R) -> SELECTION",
+    }
+    total = a["n_with_mfe"]
+    for key, label in labels.items():
+        rows = a["buckets"][key]
+        if not rows:
+            continue
+        gb = [e["give_back"] for e in rows if e["give_back"] is not None]
+        avg_gb = (sum(gb) / len(gb)) if gb else None
+        share = len(rows) / total * 100
+        print(f"\n  {label}")
+        print(f"    n={len(rows)} ({share:.0f}%)  avg give-back {_r(avg_gb)}")
+        for e in rows[:6]:
+            day_txt = f"d{e['day']}" if e["day"] is not None else "d?"
+            print(f"      {e['ticker']:<6} {e['outcome']:<18} "
+                  f"mfe {e['mfe_r']:.2f}R @{day_txt} -> {_r(e['r'])}")
+
+    if a["exec_bugs"]:
+        print(f"\n  EXECUTION BUG — TP1 was reachable but never tagged:")
+        for e in a["exec_bugs"]:
+            print(f"      {e['ticker']:<6} mfe {e['mfe_r']:.2f}R "
+                  f"but outcome = {e['outcome']}")
+        print("    TP1 order was not placed or did not trigger. This is a")
+        print("    process failure, not a strategy result — fix it directly.")
+
+    nowhere = len(a["buckets"]["went_nowhere"])
+    if total and nowhere / total >= 0.5:
+        print(f"\n  >>> {nowhere}/{total} trades never reached "
+              f"{MFE_WENT_NOWHERE_R}R.")
+        print("      This is a SELECTION problem. Changing hold period or")
+        print("      trailing rules cannot fix trades that never moved.")
+    if a["missing_mfe"]:
+        print(f"\n  {a['missing_mfe']} closed row(s) still missing mfe_r.")
+
+
+def print_discretionary_section(a: Dict[str, Any]) -> None:
+    print(f"\n{DIVIDER}")
+    print("  DISCRETIONARY ATTRIBUTION — system vs operator")
+    print(f"{DIVIDER}")
+    print(f"  {'group':<10}{'n':>5}{'closed':>8}{'win %':>9}{'avg R':>9}{'total R':>10}")
+    for key in ("taken", "vetoed"):
+        b = a[key]
+        print(f"  {key:<10}{b['n']:>5}{b['closed']:>8}"
+              f"{_pct(b['win_rate']):>9}{_r(b['avg_r']):>9}{_r(b['total_r']):>10}")
+
+    if a["vetoed"]["closed"] == 0:
+        print("\n  No vetoed trades have a recorded outcome, so the vetoes")
+        print("  cannot be scored. Tracking skipped signals on paper is what")
+        print("  turns a veto from an opinion into evidence.")
+    else:
+        t_avg = a["taken"]["avg_r"]
+        v_avg = a["vetoed"]["avg_r"]
+        if t_avg is not None and v_avg is not None:
+            if v_avg < t_avg:
+                print(f"\n  Vetoed avg {_r(v_avg)} < taken avg {_r(t_avg)} —")
+                print("  vetoes removed weaker trades. Worth examining whether")
+                print("  the reasons can be expressed as a rule.")
+            else:
+                print(f"\n  Vetoed avg {_r(v_avg)} >= taken avg {_r(t_avg)} —")
+                print("  the vetoes removed trades that would have done as well")
+                print("  or better. Worth knowing early.")
+    if a["vetoed_unscored"]:
+        print(f"\n  {a['vetoed_unscored']} vetoed row(s) have no outcome recorded.")
+    if a["reasons"]:
+        print("\n  Veto reasons:")
+        for reason, n in sorted(a["reasons"].items(), key=lambda x: -x[1]):
+            print(f"    {n:>3}x  {reason}")
+
+
+def print_dollars_section(a: Dict[str, Any]) -> None:
+    print(f"\n{DIVIDER}")
+    print("  DOLLAR RECONCILIATION (floating 2% risk)")
+    print(f"{DIVIDER}")
+    print(f"  Rows converted:   {a['counted']}")
+    print(f"  Start equity:     ${a['start_equity']:.2f}")
+    print(f"  Realised P&L:     ${a['realized_usd']:+.2f}")
+    print(f"  Implied equity:   ${a['end_equity']:.2f}  ({a['return_pct']:+.2f}%)")
+    print("\n  Computed the same way sheets_logger.read_equity() computes it:")
+    print("  sum(r_realized x risk_usd) per row. If this disagrees with the")
+    print("  broker balance, the data is wrong, not the arithmetic.")
+    print("  NOTE: gross of fees. Fee drag runs ~0.14-0.16R per trade,")
+    print("  roughly 45% of gross expectancy at Batch 3 levels.")
+    if a["missing_risk"]:
+        print(f"\n  {len(a['missing_risk'])} closed row(s) have NO risk_usd:")
+        print(f"    {', '.join(a['missing_risk'][:10])}")
+        print("    These are invisible to the running-equity calculation —")
+        print("    every trade sized after them used a wrong balance.")
+
+
+def print_force_closed_section(a: Dict[str, Any]) -> None:
+    if a["forced"]["n"] == 0:
+        return
+    print(f"\n{DIVIDER}")
+    print("  FORCE-CLOSED vs NATURAL EXIT")
+    print(f"{DIVIDER}")
+    print(f"  {'group':<10}{'n':>5}{'wins':>7}{'win %':>9}{'avg R':>9}")
+    for key in ("natural", "forced"):
+        b = a[key]
+        print(f"  {key:<10}{b['n']:>5}{b['wins']:>7}"
+              f"{_pct(b['win_rate']):>9}{_r(b['avg_r']):>9}")
+    print("\n  Force-closed trades ended on a calendar cutoff, not on their")
+    print("  own rule. They stay in the totals but their outcomes are")
+    print("  truncated for reasons unrelated to the strategy.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="SP500 Swing Agent — shadow log diagnostic",
@@ -801,12 +1313,33 @@ Examples:
         action="store_true",
         help="Show only rows where EMA9 limit did not fill",
     )
+    parser.add_argument(
+        "--exclude-vetoed",
+        action="store_true",
+        help="Phase 2.6: restrict every analysis to discretionary_action == TAKEN",
+    )
+    parser.add_argument(
+        "--start-equity",
+        type=float,
+        default=100.0,
+        metavar="USD",
+        help="Starting equity for dollar reconciliation (default: 100)",
+    )
     args = parser.parse_args()
 
     # ── Load ──────────────────────────────────────────────────
     rows = load_shadow_log(args.csv)
     if not rows:
         sys.exit(1)
+
+    # ── Phase 2.6: discretionary filter ───────────────────────
+    # Applied BEFORE every other analysis so "how did the executed
+    # strategy do" is answered on executed trades only.
+    if args.exclude_vetoed:
+        before = len(rows)
+        rows = get_taken(rows)
+        print(f"\n[FILTER] --exclude-vetoed: {before} -> {len(rows)} rows "
+              f"({before - len(rows)} vetoed excluded)")
 
     # ── Apply --show-unfilled filter ──────────────────────────
     display_rows = get_unfilled(rows) if args.show_unfilled else rows
@@ -852,6 +1385,17 @@ Examples:
         print_outcomes_section(outcome_analysis, outcome_breakdown)
         print_soft_warning_section(soft_analysis)
         print_rs_lookback_comparison(rs_lookback_analysis)
+
+        # ── Phase 2.6 sections ────────────────────────────────
+        # Ordered by decision value: MFE first (it decides WHAT to fix
+        # next), then entry type, attribution, dollars, force-closed.
+        print_mfe_section(analyse_mfe_giveback(closed))
+        print_entry_type_section(analyse_entry_type(closed))
+        if not args.exclude_vetoed:
+            print_discretionary_section(analyse_discretionary(rows))
+        print_dollars_section(analyse_dollars(closed, args.start_equity))
+        print_force_closed_section(analyse_force_closed(closed))
+
         print_data_quality_note(rows)
 
     print(f"\n{DIVIDER}\n")
