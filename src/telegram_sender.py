@@ -249,13 +249,42 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     msg += f"TP1:   `${tp1:.2f}` ({tp1_pct:+.2f}%, RR {rr1:.2f})\n"
     msg += f"TP2:   `${tp2:.2f}` ({tp2_pct:+.2f}%, RR {rr2:.2f})\n\n"
 
+    # ── Sizing (Phase 2.6) ──────────────────────────────────
+    # Shows the equity BASIS this signal was sized against and the resulting
+    # dollar risk. Notional is deliberately NOT shown: the operator sizes on
+    # risk, and an extra number here is noise at the moment of execution.
+    #
+    # The basis differs per signal within a run — the waterfall cascade
+    # deducts each signal's risk before sizing the next, so signal #2 is
+    # sized against a smaller basis than #1. Showing the basis makes that
+    # visible instead of looking like an inconsistency.
+    basis = signal.get("_equity_basis")
+    risk_usd = signal.get("risk_amount_usd")
+    if basis is not None and risk_usd is not None:
+        rank = signal.get("_size_rank")
+        rank_txt = f" (#{rank})" if rank else ""
+        msg += f"📐 *Sizing*{rank_txt}\n"
+        msg += f"Basis: `${float(basis):.2f}` → Risk: `${float(risk_usd):.2f}`"
+        msg += f" ({config.MAX_RISK_PER_TRADE_PCT}%)\n"
+        if signal.get("_risk_capped"):
+            msg += "⚠️ Risk below budget — stop tighter than risk %\n"
+        msg += "\n"
+
     # ── Mandatory filters (all 5 passed by definition) ──────
     msg += f"{config.MANDATORY_PASS_EMOJI} *MANDATORY* (all 5 passed)\n"
-    msg += "✓ Price > EMA(50)\n"
-    msg += "✓ ADX > 25 + (+DI dominant)\n"
-    msg += "✓ RSI > 45\n"
-    msg += "✓ Volume > 1.3x avg\n"
-    msg += "✓ ATR > 1.5% of price\n\n"
+    # Phase 2.6: read from config rather than repeating literals. These were
+    # hard-coded here AND in indicators.py, so a threshold change would have
+    # silently left this display announcing the old numbers.
+    _ema_p = getattr(config, "EMA_TREND_ANCHOR_PERIOD", 50)
+    _adx_t = getattr(config, "ADX_THRESHOLD", 25)
+    _rsi_t = getattr(config, "RSI_MIN", 45)
+    _vol_t = getattr(config, "VOLUME_RATIO_MIN", 1.3)
+    _atr_t = getattr(config, "ATR_PCT_MIN", 1.5)
+    msg += f"✓ Price > EMA({_ema_p})\n"
+    msg += f"✓ ADX > {_adx_t} + (+DI dominant)\n"
+    msg += f"✓ RSI > {_rsi_t}\n"
+    msg += f"✓ Volume > {_vol_t}x avg\n"
+    msg += f"✓ ATR > {_atr_t}% of price\n\n"
 
     # ── Confluence (Phase 2.3: "context only" — not predictive) ─
     confluence_display = signal.get("confluence_display", "N/A")
@@ -335,11 +364,21 @@ def _format_signal(signal: Dict[str, Any]) -> str:
 def send_daily_signals(
     signals: List[Dict[str, Any]],
     macro: Dict[str, Any],
+    equity_basis: Optional[float] = None,
+    equity_source: str = "",
 ) -> bool:
     """
     Send approved signals via Telegram.
     Sends header message + one message per signal.
     Returns True if all messages sent successfully.
+
+    Phase 2.6: the header now states the equity basis and where it came
+    from. equity_source is one of "sheets" (live), "cache" (stale — the
+    Sheets read failed) or "start" (no cache either). Anything other than
+    "sheets" is flagged inline, because sizing computed off a stale balance
+    looks completely normal otherwise — the failure has no other symptom.
+
+    Both new args are optional so existing callers keep working.
     """
     if not signals:
         logger.warning("send_daily_signals called with empty list")
@@ -350,7 +389,15 @@ def send_daily_signals(
     # Header message
     header = f"{config.SIGNAL_HEADER_EMOJI} *DAILY SIGNALS — {today}*\n\n"
     header += _format_macro_header(macro) + "\n\n"
-    header += f"📤 *{len(signals)} signal(s)* approved\n\n"
+    header += f"📤 *{len(signals)} signal(s)* approved\n"
+    if equity_basis is not None:
+        src_flag = {
+            "sheets": "",
+            "cache": "  ⚠️ CACHED — verify sheet",
+            "start": "  🔴 NO DATA — do not execute",
+        }.get(equity_source, "")
+        header += f"💵 Equity: `${float(equity_basis):.2f}`{src_flag}\n"
+    header += "\n"
 
     for s in signals:
         sig_emoji, _ = _conviction_tier(s.get("conviction", 0))
@@ -430,6 +477,86 @@ def send_shadow_log(
 # ============================================================
 # NO SIGNAL DAY
 # ============================================================
+
+# ============================================================
+# PHASE 2.6 — TWO-STAGE ENTRY ALERTS + OPS WARNINGS
+# ============================================================
+
+def send_stage2_alerts(fallbacks: List[Dict[str, Any]], run_date: str) -> bool:
+    """
+    Alert for near-miss signals eligible for Stage-2 execution.
+
+    Context: yesterday's EMA9 limit did not fill, but the session low DID
+    enter [EMA9, EMA9 + ENTRY2_ATR_TOLERANCE x ATR]. The setup is executed
+    at MARKET on today's open instead.
+
+    Two things this message must make unmissable, because getting either
+    wrong silently corrupts the R-multiple on the trade:
+
+      1. Stop and TP must be recomputed from the ACTUAL fill price, not
+         from EMA9. A market entry above EMA9 with an EMA9-derived stop is
+         a wider-than-1R risk wearing a 1R label.
+      2. The actual fill must be typed back into the pending tab. The
+         system never observes it — execution is manual.
+
+    Why this exists at all: on Batch 3, unfilled EMA9 orders went on to hit
+    TP1 at a rate significantly higher than filled ones (Fisher exact
+    p ~ 0.007 on 8/8). The limit was systematically filling on weakness and
+    missing the strongest continuations. ENTRY2_ATR_TOLERANCE = 0.15 is an
+    IN-SAMPLE fit on 5 observed near-misses and catches 2 of them — it is
+    provisional, and this alert path is how it gets tested out-of-sample.
+    """
+    if not fallbacks:
+        return False
+
+    sep = "──────────────────────────────────────────"
+    msg = f"🔁 *STAGE 2 ENTRY — {run_date}*\n"
+    msg += "_Yesterday's EMA9 limit missed by a hair. Market on open._\n"
+    msg += f"`{sep}`\n\n"
+
+    for fb in fallbacks:
+        ticker = fb.get("ticker", "?")
+        ema9 = float(fb.get("ema9_price", 0) or 0)
+        zone_high = float(fb.get("zone_high", 0) or 0)
+        low = float(fb.get("day_low", 0) or 0)
+        atr = float(fb.get("atr", 0) or 0)
+        miss_atr = ((low - ema9) / atr) if atr > 0 else 0.0
+
+        msg += f"*{ticker}* (signalled {fb.get('signal_date', '?')})\n"
+        msg += f"EMA9 limit: `${ema9:.2f}`\n"
+        msg += f"Session low: `${low:.2f}` — missed by {miss_atr:.2f}×ATR\n"
+        msg += f"Zone was: `${ema9:.2f}` → `${zone_high:.2f}`\n"
+        msg += "➡️ Execute at MARKET on open\n\n"
+
+    msg += f"`{sep}`\n"
+    msg += "⚠️ *Recompute stop and TP from your ACTUAL fill*, not from EMA9.\n"
+    msg += "Stop = fill − 1.5×ATR | TP1 = fill + 2R | TP2 = fill + 3R\n"
+    msg += "📝 Then enter the fill price in `pending_entries` → `actual_entry`."
+
+    return _send_message(msg)
+
+
+def send_ops_warnings(warnings: List[str]) -> bool:
+    """
+    One batched message for operational problems the operator must act on:
+    a cached (stale) equity value, shadow-log rows still missing an outcome,
+    closed rows missing risk_usd, an unreadable pending tab.
+
+    Batched rather than interleaved with signals on purpose — these are easy
+    to scroll past when scattered, and every one of them means the numbers
+    in the signal messages are quietly less trustworthy than they look.
+
+    Sent on EVERY exit path, including no-signal days. A stale-equity warning
+    matters more on a quiet day, because nothing else would reveal it.
+    """
+    if not warnings:
+        return False
+    msg = "🛠️ *OPS WARNINGS*\n"
+    msg += "_Signals above are still valid — but check these first._\n\n"
+    for w in warnings:
+        msg += f"• {w}\n\n"
+    return _send_message(msg)
+
 
 def send_no_signal_day(
     reason: str,
