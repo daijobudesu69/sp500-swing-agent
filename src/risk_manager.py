@@ -46,8 +46,14 @@ RULE 6 DESIGN (CONVICTION) — CHANGED June 2026:
 RULE 8 DESIGN (TIER 1):
   - If tier_1_pass=False due to RR only → soft warning, not rejection
   - Other TIER 1 failures (macro, weekly downtrend) → hard rejection
-  - NOTE: analyst.py Opus prompt should also remove RR from TIER 1 veto
-    conditions (pending revision)
+  - RESOLVED (verified Aug 2026, Phase 2.6 code audit): the analyst.py Opus
+    prompt no longer lists RR as a TIER 1 veto condition. TIER 1 now has
+    exactly two conditions — macro regime (VIX < 25 OR SPY > 200MA) and
+    weekly trend (fails only on "bearish"). RR was demoted to a 10% scoring
+    component. That change actually shipped in Phase 2.2 (see analyst.py
+    module docstring: "TIER 1 veto (macro + weekly trend only — RR
+    removed)"); only this "pending revision" note was left behind and was
+    still describing work that had already been done.
 
 CATCHES:
   - LLM hallucinations (impossible prices, wrong direction, math errors)
