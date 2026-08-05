@@ -551,10 +551,24 @@ BLACK_SWAN_TYPE_C = {
 SP500_CSV_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 SP500_WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
-# Liquidity & quality filters (used by universe.py / data_fetcher)
-MIN_PRICE = 5.0
-MIN_AVG_VOLUME = 1_000_000
-MIN_MARKET_CAP = 5_000_000_000
+# ⚠️ NOT ENFORCED (verified by grep, Phase 2.6.3 audit).
+# The comment here used to read "used by universe.py / data_fetcher". It is
+# not: these three constants are referenced ZERO times outside this file.
+# universe.py returns the raw S&P 500 constituent list with no liquidity or
+# market-cap screen applied, and never has.
+#
+# They are NOT being wired now, on purpose. Turning them on would change the
+# screener universe mid-project, which is a filter change — and Benjamini-
+# Hochberg returned 0/9 on Batch 3, so no filter change is authorised. In
+# practice the S&P 500 membership rules already dominate all three thresholds
+# (no constituent trades under $5 or below a $5B cap), so the expected effect
+# is nil — but "expected nil" is a hypothesis, not a measurement.
+#
+# Left as documentation of intent. Wire them only with evidence, and only at
+# a batch boundary.
+MIN_PRICE = 5.0                         # NOT ENFORCED
+MIN_AVG_VOLUME = 1_000_000              # NOT ENFORCED
+MIN_MARKET_CAP = 5_000_000_000          # NOT ENFORCED
 
 # Funnel sizing
 LLM_HAIKU_TOP_N = 5                     # NEW: number Haiku promotes to Opus
@@ -591,7 +605,16 @@ SECTOR_ETFS_MAP = {
 # ============================================================
 # Daily signal — 8 AM Jakarta = 01:00 UTC, runs Tue-Sat (covers US Mon-Fri sessions)
 DAILY_SIGNAL_CRON_PRIMARY_UTC = "0 1 * * 2-6"     # 8:00 AM WIB
-DAILY_SIGNAL_CRON_BACKUP_UTC = "30 1 * * 2-6"     # 8:30 AM WIB (backup if primary fails)
+# PHASE 2.6.3 — NOT DEPLOYED. This constant described a backup run that does
+# not exist in .github/workflows/daily_signal.yml, which has exactly ONE cron.
+# It is kept as documentation of a REJECTED design, not as a live schedule:
+# a second daily cron would run the whole pipeline twice, sending duplicate
+# signals and queueing every pending row twice (the resolver matches on
+# (ticker, signal_date), so a duplicate row is ambiguous and would be SKIPPED
+# by update_shadow_rows' "len(matches) != 1" guard — silently losing the
+# entry_type write-back for that ticker).
+# If the primary cron fails, use workflow_dispatch, not a second schedule.
+DAILY_SIGNAL_CRON_BACKUP_UTC = None                # deliberately not scheduled
 
 # Black swan watcher — every 15min during US market hours (9:30 AM - 4 PM ET)
 # UTC: 13:00 - 21:00, Mon-Fri (widened window to safely cover both EST/EDT)
@@ -633,7 +656,15 @@ LLM_MAX_TOKENS_DEEP = 2048                        # ~$0.05 per Opus call
 # LLM_TEMPERATURE removed — caused 400 errors on Opus 4.7
 LLM_USE_PROMPT_CACHING = True                     # Cost optimization
 
-DAILY_LLM_BUDGET_USD = 1.50                       # Hard stop if exceeded
+# ⚠️ NOT ENFORCED (verified by grep, Phase 2.6.3 audit). The comment used to
+# say "Hard stop if exceeded". There is no hard stop: this constant is read
+# ZERO times outside this file. Actual per-run cost is bounded structurally
+# instead — Haiku runs once per F1-F5 survivor (typically 1-20) and Opus is
+# capped at FUNNEL_MAX_DEEP_ANALYSIS calls, so a worst-case run is well under
+# $0.40. A mid-run hard stop is deliberately NOT added: truncating a batch
+# part-way would change which signals exist that day, making Batch 4
+# unattributable for the sake of a cost ceiling that has never been hit.
+DAILY_LLM_BUDGET_USD = 1.50                       # NOT ENFORCED — see note
 
 
 # ============================================================
