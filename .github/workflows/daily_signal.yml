@@ -11,7 +11,42 @@ on:
       verification:
         description: 'Stamp every shadow row VETOED — excluded from equity and Batch 4 stats'
         type: boolean
-        default: true
+        # PHASE 2.6.3 (bug B8) — DEFAULT FLIPPED true -> false.
+        #
+        # There is exactly one daily cron and no backup schedule, so the only
+        # recovery path for a failed scheduled run is a manual dispatch. With
+        # the old default, that recovery run stamped every row VETOED — the
+        # trades would be sent to Telegram, executed for real, and then
+        # excluded from equity forever, with the only symptom being a banner
+        # the operator had no reason to expect on a normal trading day.
+        #
+        # Flipping the default does NOT weaken the pre-launch protection: a
+        # pre-launch run requires force_run=true, and the guard step below
+        # HARD FAILS that combination unless verification is explicitly set
+        # true. So the failure mode moves from "silent equity contamination"
+        # to "loud error telling you which box to tick" — which is the same
+        # trade the write-time VETOED stamp made in 2.6.1.
+        default: false
+
+# PHASE 2.6.3 (bug B3) — WITHOUT THIS THE EQUITY CACHE NEVER PERSISTS.
+# The "Commit equity cache" step below runs git push. GITHUB_TOKEN defaults to
+# read-only on this repo (black_swan.yml declares contents: write explicitly,
+# which is why its marker commits work and .last_equity has never appeared in
+# the tree). The push was returning 403, swallowed by continue-on-error, so
+# tier 2 of the three-tier equity resolution — Sheets -> cache -> start — did
+# not exist: any Sheets failure fell straight through to ACCOUNT_START_USD.
+# Never caught in testing because every verification run SKIPS this step.
+permissions:
+  contents: write
+
+# One pipeline at a time. Two concurrent runs would both read the same pending
+# rows, both resolve them, and both queue a fresh set — and update_shadow_rows
+# refuses to write when (ticker, date) matches more than one row, so the
+# duplicates would silently lose their entry_type write-back.
+concurrency:
+  group: daily-swing-signal
+  cancel-in-progress: false
+
 jobs:
   run-daily-pipeline:
     runs-on: ubuntu-latest
@@ -112,7 +147,14 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add .last_equity
             git commit -m "chore: update equity cache [skip ci]"
-            git push
+            # PHASE 2.6.3 (bug B18) — rebase before pushing. The black swan
+            # watcher runs every 15 minutes and commits its own marker files
+            # to the same branch; without this, any commit landing between
+            # this job's checkout and its push makes the push non-fast-forward
+            # and it fails. continue-on-error then hides it, and the cache
+            # silently stops updating.
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           else
             echo "No equity cache change to commit."
           fi
