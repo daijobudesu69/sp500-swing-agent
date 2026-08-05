@@ -217,7 +217,7 @@ import os
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 
 import pandas as pd
@@ -854,20 +854,35 @@ def _resolve_equity() -> Dict[str, Any]:
 def _apply_waterfall_sizing(signals: List[Dict[str, Any]], equity: float) -> float:
     """
     Size a batch of same-day signals off a running basis, highest Haiku
-    score first:
+    score first.
 
-        signal 1 -> 2% of equity
-        signal 2 -> 2% of (equity - signal 1 risk)
-        signal 3 -> 2% of (equity - signal 1 - signal 2)
+    PHASE 2.6.2 — WHAT GETS DEDUCTED NOW DEPENDS ON THE SIZING MODE.
 
-    What is deducted is RISK, not notional. Total notional across signals
-    can therefore exceed the cash balance — that is expected and is the
-    operator's call at execution time, which is why the Telegram message
-    shows the basis and risk for each signal rather than a single number.
+    notional mode (Batch 4):
+        signal 1 -> 4% of equity
+        signal 2 -> 4% of (equity - signal 1 NOTIONAL)
+        ...
+      The running basis tracks CASH. Total capital deployed can never
+      exceed the balance, which is the whole point of the mode.
+
+    risk mode (Phase 2.6 behaviour):
+        deducts RISK. Total notional across signals could then exceed the
+        cash balance — a real gap, since the cascade would report room for
+        more signals than the account could actually fund. Observed on the
+        5 Aug run: basis went $100 -> $96.04 (risk $3.96 deducted) while
+        the two positions actually required $68.90 of capital. With only
+        low-ATR names that day, they would not have fit.
+
+    Deducting the wrong quantity is the same class of error either way:
+    a budget that is checked against something other than the constraint
+    that actually binds.
 
     Returns the remaining basis after the cascade.
     """
     basis = float(equity)
+    mode = str(getattr(config, "SIZING_MODE", "risk")).strip().lower()
+    deduct_key = "position_size_usd" if mode == "notional" else "risk_amount_usd"
+
     ranked = sorted(
         signals,
         key=lambda x: (_safe_float(x.get("_haiku_score"), 0.0)),
@@ -876,7 +891,7 @@ def _apply_waterfall_sizing(signals: List[Dict[str, Any]], equity: float) -> flo
     for rank, sig in enumerate(ranked, start=1):
         risk_mod.apply_position_sizing(sig, basis)
         sig["_size_rank"] = rank
-        basis -= float(sig.get("risk_amount_usd", 0) or 0)
+        basis -= float(sig.get(deduct_key, 0) or 0)
         if basis <= 0:
             logger.warning("Waterfall basis exhausted — remaining signals size to ~0.")
             basis = 0.0
@@ -1255,10 +1270,10 @@ def run_daily_signals() -> Dict[str, Any]:
     Triggered by GitHub Actions cron at 01:00 UTC (8:00 AM WIB).
     """
     start_time = time.time()
-    run_date = datetime.utcnow().strftime("%Y-%m-%d")
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     logger.info("=" * 60)
     logger.info("DAILY SIGNAL PIPELINE — STARTING")
-    logger.info(f"Run timestamp: {run_date}T{datetime.utcnow().strftime('%H:%M:%S')}Z")
+    logger.info(f"Run timestamp: {run_date}T{datetime.now(timezone.utc).strftime('%H:%M:%S')}Z")
     if getattr(config, "VERIFICATION_RUN", False):
         logger.warning("*** VERIFICATION RUN *** — every shadow row written by "
                        "this run is stamped VETOED and excluded from equity. "
@@ -1557,7 +1572,11 @@ def run_daily_signals() -> Dict[str, Any]:
         logger.info(
             f"Waterfall sizing: basis ${equity_basis:.2f} -> ${remaining_basis:.2f} "
             f"across {len(approved)} signal(s) at "
-            f"{config.MAX_RISK_PER_TRADE_PCT}% each"
+            f"{config.NOTIONAL_PER_TRADE_PCT}% notional each"
+            if str(getattr(config, "SIZING_MODE", "risk")).lower() == "notional"
+            else f"Waterfall sizing: basis ${equity_basis:.2f} -> "
+                 f"${remaining_basis:.2f} across {len(approved)} signal(s) at "
+                 f"{config.MAX_RISK_PER_TRADE_PCT}% risk each"
         )
 
         # --------------------------------------------------------
@@ -1686,7 +1705,7 @@ def run_black_swan_check() -> Dict[str, Any]:
     result = {"status": "no_event", "alert_sent": False}
 
     try:
-        run_date = datetime.utcnow().strftime("%Y-%m-%d")
+        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         marker_path = getattr(config, "BLACK_SWAN_MARKER_PATH", ".last_alert_date")
 
         # Dedup — already alerted today?
@@ -1842,7 +1861,7 @@ def run_black_swan_heartbeat() -> Dict[str, Any]:
     result = {"status": "sent", "alert_sent": False}
 
     try:
-        run_date = datetime.utcnow().strftime("%Y-%m-%d")
+        run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         heartbeat_path = getattr(config, "BLACK_SWAN_HEARTBEAT_PATH", ".last_heartbeat")
 
         macro_ctx = data_mod.fetch_market_context()
