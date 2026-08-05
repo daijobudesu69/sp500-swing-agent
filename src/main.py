@@ -1204,7 +1204,13 @@ def _queue_pending_entries(signals: List[Dict[str, Any]], run_date: str) -> bool
     # rationale and the two timing cases it resolves.
     bar_date = ""
     try:
-        spy_df = data_mod.fetch_ohlcv("SPY", period="5d", interval="1d")
+        # period="1mo" (~21 bars), NOT "5d". fetch_ohlcv() rejects any frame
+        # with fewer than 10 bars (data_fetcher.py: `if len(df) < 10: return
+        # None`), so a 5-day window returns None and bar_date silently ends
+        # up blank — observed on the 5 Aug 00:03 UTC run, which logged
+        # "bar_date unavailable" and fell back to the legacy anchor.
+        # Only the LAST index is used; the extra bars cost nothing.
+        spy_df = data_mod.fetch_ohlcv("SPY", period="1mo", interval="1d")
         if spy_df is not None and not spy_df.empty:
             bar_date = str(spy_df.index[-1].strftime("%Y-%m-%d"))
     except Exception as e:
@@ -1766,26 +1772,62 @@ def _compute_weekly_extremes() -> Dict[str, float]:
     """
     Worst single-day SPY return & largest single-day VIX spike over the
     last ~5 trading days. Fail-soft — returns 0.0 on insufficient data.
+
+    PHASE 2.6.1 BUG FIX — this function was returning 0.0 / 0.0 EVERY WEEK.
+
+    It requested period="5d", which yields ~5 bars. fetch_ohlcv() rejects
+    anything under 10 bars (`if len(df) < 10: return None`) and returns None
+    WITHOUT raising, so:
+      - `if spy_df is not None` simply failed
+      - the `except` block never fired, so nothing was logged
+      - `out` was returned untouched at its 0.0 defaults
+
+    The heartbeat's entire purpose (Phase 2.5, check A2) is to prove each
+    week that the watcher's threshold-comparison logic is reading REAL
+    market data. Reporting a hardcoded 0.0 dressed up as "worst SPY day"
+    proved the opposite of what it claimed — and a fail-soft default that
+    always reads "perfectly calm" is the most dangerous possible default
+    for a crash detector's self-test.
+
+    Fixed by requesting 1mo (~21 bars, clears the floor) and slicing to the
+    last 6 closes, which yields the 5 daily returns actually wanted.
     """
     out = {"worst_spy_day_pct": 0.0, "max_vix_spike_pct": 0.0}
+    ok = {"spy": False, "vix": False}
 
     try:
-        spy_df = data_mod.fetch_ohlcv("SPY", period="5d", interval="1d")
+        spy_df = data_mod.fetch_ohlcv("SPY", period="1mo", interval="1d")
         if spy_df is not None and len(spy_df) >= 2:
-            daily_rets = spy_df["Close"].pct_change().dropna() * 100
+            daily_rets = spy_df["Close"].tail(6).pct_change().dropna() * 100
             if len(daily_rets) > 0:
                 out["worst_spy_day_pct"] = round(float(daily_rets.min()), 2)
+                ok["spy"] = True
     except Exception as e:
         logger.warning(f"Weekly SPY extreme compute failed: {e}")
 
     try:
-        vix_df = data_mod.fetch_ohlcv("^VIX", period="5d", interval="1d")
+        vix_df = data_mod.fetch_ohlcv("^VIX", period="1mo", interval="1d")
         if vix_df is not None and len(vix_df) >= 2:
-            daily_spikes = vix_df["Close"].pct_change().dropna() * 100
+            daily_spikes = vix_df["Close"].tail(6).pct_change().dropna() * 100
             if len(daily_spikes) > 0:
                 out["max_vix_spike_pct"] = round(float(daily_spikes.max()), 2)
+                ok["vix"] = True
     except Exception as e:
         logger.warning(f"Weekly VIX extreme compute failed: {e}")
+
+    # Say so when the numbers are defaults rather than measurements. A
+    # silent 0.0 is indistinguishable from a genuinely flat week, which is
+    # exactly how this went unnoticed.
+    if not ok["spy"] or not ok["vix"]:
+        logger.warning(
+            f"Weekly extremes INCOMPLETE (spy_ok={ok['spy']}, vix_ok={ok['vix']}) "
+            f"— any 0.0 below is a default, NOT a measurement."
+        )
+    else:
+        logger.info(
+            f"Weekly extremes: worst SPY day {out['worst_spy_day_pct']:+.2f}%, "
+            f"max VIX spike {out['max_vix_spike_pct']:+.2f}%"
+        )
 
     return out
 
