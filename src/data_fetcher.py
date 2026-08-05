@@ -194,6 +194,21 @@ def fetch_market_context() -> Dict[str, Any]:
         "dxy": 100.0,
         "dxy_5d_change_pct": 0.0,
         "sector_5d_perf": {},
+        # PHASE 2.6.3 — PROVENANCE FLAGS.
+        # Every numeric field above is a FAIL-SOFT DEFAULT, and the defaults
+        # all read "calm market": VIX 20, no spike, SPY flat and above its
+        # 200MA. For a crash detector that is the most dangerous possible
+        # default — run_black_swan_check() comparing vix_spike_pct 0.0 against
+        # a +30% trigger cannot tell "the market is fine" from "yfinance
+        # returned nothing", and both produce a silent pass.
+        #
+        # This is the same defect class as _compute_weekly_extremes() in
+        # Phase 2.6.1 (§2.7), which returned hardcoded 0.0 dressed as a market
+        # reading every week for months. The fix there was to say so out loud;
+        # same fix here. Callers that make a DECISION on these numbers must
+        # check the flag first — see run_black_swan_check().
+        "spy_data_ok": False,
+        "vix_data_ok": False,
     }
 
     # === SPY ===
@@ -217,6 +232,7 @@ def fetch_market_context() -> Dict[str, Any]:
                 ctx["spy_1d_change_pct"] = round(
                     ((float(close.iloc[-1]) / float(close.iloc[-2])) - 1) * 100, 2
                 )
+                ctx["spy_data_ok"] = True
     except Exception as e:
         logger.warning(f"SPY fetch failed: {e}")
 
@@ -231,6 +247,7 @@ def fetch_market_context() -> Dict[str, Any]:
             ctx["vix_spike_pct"] = round(
                 ((float(vix_close.iloc[-1]) / float(vix_close.iloc[-2])) - 1) * 100, 2
             )
+            ctx["vix_data_ok"] = True
     except Exception as e:
         logger.warning(f"VIX fetch failed: {e}")
 
@@ -260,6 +277,14 @@ def fetch_market_context() -> Dict[str, Any]:
         except Exception:
             pass
     ctx["sector_5d_perf"] = perf
+
+    if not ctx["spy_data_ok"] or not ctx["vix_data_ok"]:
+        logger.warning(
+            f"MARKET CONTEXT INCOMPLETE (spy_ok={ctx['spy_data_ok']}, "
+            f"vix_ok={ctx['vix_data_ok']}) — the missing side below is a "
+            f"DEFAULT, not a measurement. Any threshold comparison against it "
+            f"is meaningless."
+        )
 
     logger.info(
         f"Market: VIX={ctx['vix']:.2f} (spike {ctx['vix_spike_pct']:+.1f}%), "
