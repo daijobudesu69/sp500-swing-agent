@@ -194,11 +194,14 @@ CONVICTION TIERS:
   < 50   = SKIP
 
 ENTRY AND POSITION SIZING:
-  Account: $100 starting equity. Max risk per trade: 2% of CURRENT equity.
-  DO NOT try to compute exact position size. The system recomputes shares,
-  notional and risk deterministically after you respond, using the live
-  equity balance (which you cannot see). Report your best estimate in the
-  sizing fields; they will be overwritten. Focus on entry/stop/TP geometry.
+  DO NOT compute position size. The system sizes every trade deterministically
+  after you respond, from a live equity balance and a sizing mode you cannot
+  see, and OVERWRITES whatever you put in the sizing fields. Put any placeholder
+  there and spend your effort on entry/stop/TP geometry and the thesis instead.
+  (Phase 2.6.3: this section previously stated a specific account size and risk
+  percentage. Those numbers were stale — they described the Phase 2.6 risk-based
+  scheme, not the notional-based scheme now in use — and stating them at all
+  invites the model to reason from a budget that does not exist.)
   Entry = EMA9 value (provided in prompt data as ema_9).
          This is a LIMIT ORDER — you place the limit at EMA9 before US open.
          If price never pulls back to EMA9, the order does not fill. That is correct.
@@ -244,7 +247,7 @@ CRITICAL RULES:
   - LONG only (entry > stop_loss ALWAYS — if not, output is rejected)
   - Entry MUST equal the ema_9 value provided. Do not use close price as entry.
   - RR: calculate accurately. If RR < 2:1, report it honestly — do NOT auto-cap conviction. User decides entry.
-  - Risk amount is set by the system (2% of current equity), not by you.
+  - Risk amount and share count are set by the system, not by you.
   - Be honest. Mediocre setup = mediocre score.
   - If TIER 1 fails (macro/trend only): conviction=0, tier_1_pass=false, tier_1_fail_reason required.
   - TIER 1 never fails due to RR alone — RR is informational only.
@@ -468,7 +471,15 @@ def opus_deep_analysis(ticker: str, full_data: Dict[str, Any]) -> Dict[str, Any]
             # gate was tested on Batch 3 and rejected: better backtested R,
             # but it removed the 6 largest winners (+8.4R) and cut breadth
             # 32 -> 13 (~36% of statistical power).
-            "spy_vs_ema20": ind.get("spy_vs_ema20", ""),
+            # PHASE 2.6.3 (bug B15) — was "spy_vs_ema20". main.py STAGE 5b
+            # writes "spy_vs_sma20" and _build_shadow_rows() reads
+            # "spy_vs_sma20", so this key was an orphan that never reached the
+            # log. Harmless only because main.py happened to overwrite it —
+            # i.e. it survived by luck, exactly like the rs_60d_gap/rs_126d_gap
+            # blank-column bug this dict is annotated to prevent. Renamed to
+            # match, and named sma (not ema) because fetch_market_context()
+            # returns a SIMPLE moving average.
+            "spy_vs_sma20": ind.get("spy_vs_sma20", ""),
             "vix_level": ind.get("vix_level", ""),
             "pct_above_50dma": ind.get("pct_above_50dma", ""),
         }
@@ -561,9 +572,10 @@ Sector ({fund.get('sector', '?')}) 5d perf: {macro.get('sector_5d_perf', {}).get
 
 === TASK ===
 Produce full trade signal JSON per the system prompt schema.
-Account: $100. Max risk: $3 (3%). Min RR: 2:1.
+Sizing is computed by the system AFTER you respond — do not attempt it.
+Min RR: {config.MIN_RR_RATIO}:1. Max hold: {config.MAX_HOLDING_DAYS} trading days.
 ENTRY MUST BE EMA9 = ${ind.get('ema_9', 0):.2f} (limit order — NOT close price).
-Stop = EMA9 - (1.5 × ATR). TP1 = EMA9 + (2 × risk). TP2 = EMA9 + (3 × risk).
+Stop = EMA9 - ({config.STOP_ATR_MULT} × ATR). TP1 = EMA9 + ({config.TP1_R_MULT:g} × risk). TP2 = EMA9 + ({config.TP2_R_MULT:g} × risk).
 Pass through confluence_display exactly as shown above.
 """
 
