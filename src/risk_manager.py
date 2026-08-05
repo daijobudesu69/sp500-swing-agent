@@ -134,27 +134,67 @@ def apply_position_sizing(signal: dict, equity_basis: float) -> dict:
         return signal
 
     risk_budget = float(equity_basis) * (config.MAX_RISK_PER_TRADE_PCT / 100.0)
+    mode = str(getattr(config, "SIZING_MODE", "risk")).strip().lower()
 
-    # Notional cap at 1x equity (no leverage). With risk at 2% and F5's ATR
-    # floor this is mathematically unreachable, so it exists only as a
-    # guard against a future config change silently re-introducing the
-    # RULE 4 / RULE 5 contradiction described above.
-    shares = risk_budget / risk_per_share
-    max_shares_by_capital = float(equity_basis) / entry
-    risk_capped = shares > max_shares_by_capital
-    if risk_capped:
-        shares = max_shares_by_capital
-        logger.warning(
-            f"  {signal.get('ticker')} notional-capped: stop {risk_per_share/entry*100:.2f}% "
-            f"is tighter than risk {config.MAX_RISK_PER_TRADE_PCT}% — "
-            f"risk reduced below budget. Check ATR floor vs risk %."
-        )
+    if mode == "notional":
+        # ----------------------------------------------------------------
+        # PHASE 2.6.2 — NOTIONAL MODE
+        #
+        # Capital deployed is the input; risk is DERIVED from the stop.
+        #
+        #     shares   = (equity x notional%) / entry
+        #     risk_usd = shares x (entry - stop)        <- floats with ATR
+        #
+        # The guard is the mirror image of risk mode's notional cap. There,
+        # a very TIGHT stop blew up the notional; here, a very WIDE stop
+        # blows up the risk. Same failure shape, opposite variable, so the
+        # same treatment: scale the position down rather than reject it, and
+        # say so in the log.
+        #
+        # At 4% notional this only binds above ~33% ATR, which F5's universe
+        # does not produce — so it is a tripwire against a future config
+        # change, not an everyday constraint.
+        # ----------------------------------------------------------------
+        notional_pct = float(getattr(config, "NOTIONAL_PER_TRADE_PCT", 4.0))
+        notional_budget = float(equity_basis) * (notional_pct / 100.0)
+        shares = notional_budget / entry
+
+        implied_risk = shares * risk_per_share
+        risk_capped = implied_risk > risk_budget
+        if risk_capped:
+            shares = risk_budget / risk_per_share
+            logger.warning(
+                f"  {signal.get('ticker')} risk-capped: stop "
+                f"{risk_per_share / entry * 100:.2f}% would put "
+                f"${implied_risk:.2f} at risk on a {notional_pct}% notional, "
+                f"over the {config.MAX_RISK_PER_TRADE_PCT}% ceiling "
+                f"(${risk_budget:.2f}). Position scaled down."
+            )
+    else:
+        # ----------------------------------------------------------------
+        # RISK MODE (Phase 2.6 behaviour, retained)
+        # ----------------------------------------------------------------
+        # Notional cap at 1x equity (no leverage). With risk at 2% and F5's
+        # ATR floor this is mathematically unreachable, so it exists only as
+        # a guard against a future config change silently re-introducing the
+        # RULE 4 / RULE 5 contradiction described above.
+        shares = risk_budget / risk_per_share
+        max_shares_by_capital = float(equity_basis) / entry
+        risk_capped = shares > max_shares_by_capital
+        if risk_capped:
+            shares = max_shares_by_capital
+            logger.warning(
+                f"  {signal.get('ticker')} notional-capped: stop {risk_per_share/entry*100:.2f}% "
+                f"is tighter than risk {config.MAX_RISK_PER_TRADE_PCT}% — "
+                f"risk reduced below budget. Check ATR floor vs risk %."
+            )
 
     signal["shares"] = round(shares, 6)
     signal["position_size_usd"] = round(shares * entry, 2)
     signal["risk_amount_usd"] = round(shares * risk_per_share, 2)
     signal["_equity_basis"] = round(float(equity_basis), 4)
     signal["_risk_capped"] = bool(risk_capped)
+    signal["_sizing_mode"] = mode
     signal["_sizing_applied"] = True
     return signal
 
