@@ -917,6 +917,71 @@ check("B9: primary cron unchanged",
 
 
 # ------------------------------------------------------------
+# B19 / B20 — entry_diagnostic could not read the live sheet
+# ------------------------------------------------------------
+print("\n=== B19/B20: the analysis tool agrees with the pipeline ===")
+
+import entry_diagnostic as _ed
+
+# B19 — the sheet's Phase 2.6 columns are BARE (no "shadow_" prefix).
+# sheets_logger._normalize() collapses both forms; this module has its own
+# normaliser, and it must recognise the same set or the two disagree.
+for _bare in ["risk_usd", "entry_type", "force_closed", "discretionary_action",
+              "veto_reason", "spy_vs_sma20", "vix_level", "pct_above_50dma",
+              "intended_notional_pct"]:
+    check(f"B19: bare '{_bare}' maps to canonical",
+          _ed._BARE_TO_CANONICAL.get(_bare) == f"_shadow_{_bare}",
+          _ed._BARE_TO_CANONICAL.get(_bare))
+
+# The narrowness guard must hold: a bare name that collides with a canonical
+# field would silently redirect reads.
+for _danger in ["date", "ticker", "stop", "tp1", "tp2", "outcome", "atr"]:
+    check(f"B19: '{_danger}' deliberately NOT bare-mapped",
+          _danger not in _ed._BARE_TO_CANONICAL,
+          "would collide with _shadow_" + _danger)
+
+_norm = _ed._normalize_fieldnames({"entry_type": "strict",
+                                   "discretionary_action": "VETOED",
+                                   "shadow_ticker": "AAPL"})
+check("B19: bare keys arrive canonical",
+      _norm.get("_shadow_entry_type") == "strict"
+      and _norm.get("_shadow_discretionary_action") == "VETOED")
+check("B19: prefixed keys still work", _norm.get("_shadow_ticker") == "AAPL")
+
+# The consequence that mattered: an unreadable action is a BLANK action, and
+# get_taken() treats blank as taken — so verification rows were entering the
+# Batch 4 sample as executed trades.
+_vetoed = _ed._coerce_row(_ed._normalize_fieldnames(
+    {"shadow_ticker": "PCAR", "discretionary_action": "VETOED"}))
+check("B19: a VETOED row is excluded from get_taken",
+      _ed.get_taken([_vetoed]) == [], "the whole point of the VETOED stamp")
+
+# B20 — ema9_filled vocabulary. Batch 3 rows say Yes/No (entered by hand);
+# _resolve_pending_entries writes TRUE/FALSE. The column is MIXED from
+# 11 Aug onwards, so both must parse.
+def _fl(v):
+    return _ed._coerce_row({"_shadow_ema9_filled": v}).get("_shadow_ema9_filled")
+
+
+for _v in ["TRUE", "true", "Yes", "yes", "Y", "1"]:
+    check(f"B20: '{_v}' -> True", _fl(_v) is True)
+for _v in ["FALSE", "false", "No", "no", "N", "0"]:
+    check(f"B20: '{_v}' -> False", _fl(_v) is False)
+check("B20: genuinely blank stays None", _fl("") is None)
+check("B20: junk stays None", _fl("maybe") is None)
+check("B20: code writes TRUE/FALSE", '"ema9_filled": "TRUE"' in main_src)
+
+_mixed = [_ed._coerce_row({"_shadow_ema9_filled": v, "_shadow_ema9_gap_pct": "1.0"})
+          for v in ["Yes", "No", "TRUE", "FALSE", ""]]
+_fr = _ed.analyse_fill_rate(_mixed)
+check("B20: mixed Yes/No + TRUE/FALSE both counted",
+      _fr["filled_n"] == 2 and _fr["unfilled_n"] == 2 and _fr["pending_n"] == 1,
+      f'filled={_fr["filled_n"]} unfilled={_fr["unfilled_n"]} pending={_fr["pending_n"]}')
+check("B20: fill rate is computable at all", _fr["fill_rate_pct"] is not None,
+      "it returned None on the entire 52-row live sheet before this fix")
+
+
+# ------------------------------------------------------------
 # Column alignment — the invariant every write depends on
 # ------------------------------------------------------------
 print("\n=== INVARIANT: positional writes stay aligned ===")
