@@ -150,16 +150,61 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # read from the Google Sheet shadow log. Unfilled and FLOAT rows are skipped
 # automatically because they have no outcome. Do NOT edit this mid-batch to
 # "update the balance" — that would double-count realised P&L.
-ACCOUNT_START_USD = 100.0
+ACCOUNT_START_USD = 82.35
 
 # Backwards-compatible alias. Several call sites (risk_manager RULE 4/RULE 5)
 # still read ACCOUNT_SIZE_USD. It means STARTING equity, not current equity;
 # current equity comes from the running-equity calculation described above.
 ACCOUNT_SIZE_USD = ACCOUNT_START_USD
 
-# Risk per trade, as a % of CURRENT equity (waterfall within a run:
-# signal 1 sizes off equity, signal 2 off equity minus signal 1's risk, etc).
-# 3.0 -> 2.0 in Phase 2.6 for the structural reason in the module docstring.
+# ============================================================
+# POSITION SIZING MODE (Phase 2.6.2)
+# ============================================================
+# "notional" — capital deployed per trade is fixed at a % of equity, and
+#              RISK is whatever the stop distance implies. Selected for
+#              Batch 4.
+# "risk"     — risk per trade is fixed at a % of equity, and NOTIONAL is
+#              whatever the stop distance implies (the Phase 2.6 behaviour).
+#
+# WHY THE SWITCH: risk-based sizing is standard practice, but it assumes
+# margin headroom. On an unleveraged cash account it produces notionals of
+# 22-89% of equity for a single position (notional = risk / stop_pct, and
+# stop = 1.5 x ATR with F5 flooring ATR at 1.5%). At 2% risk that means
+# ONE position can consume most of the account, while the waterfall — which
+# deducts RISK, not capital — happily reports room for four more. The cash
+# constraint was invisible to the sizing logic.
+#
+# Notional mode inverts the relationship: capital per trade is predictable
+# and bounded, and risk floats with volatility instead.
+SIZING_MODE = "notional"
+
+# Capital deployed per trade, as a % of CURRENT equity (waterfall within a
+# run: signal 1 sizes off equity, signal 2 off equity minus signal 1's
+# NOTIONAL, etc). 4.0 -> at most 25 concurrent positions.
+#
+# Held CONSTANT for all of Batch 4. A range (e.g. 3-5% by perceived signal
+# strength) was considered and rejected: every candidate strength metric —
+# Opus conviction, Haiku score, confluence count — has tested non-predictive,
+# and 0 of 9 hypotheses passed BH at FDR 5% in Batch 3. Varying size on an
+# unvalidated signal would also add a second uncontrolled variable to the
+# batch whose entire purpose is the out-of-sample entry_type test, making a
+# Batch 3 vs Batch 4 difference unattributable. Record the size you WOULD
+# have chosen in the manual `intended_notional_pct` column instead, and test
+# it against realised R after the batch closes.
+NOTIONAL_PER_TRADE_PCT = 4.0
+
+# Risk per trade as a % of CURRENT equity.
+#
+# In "risk" mode this is the sizing input. In "notional" mode it becomes a
+# CEILING: risk is derived from the stop, and if it would exceed this the
+# position is scaled DOWN. This is the mirror image of RULE 5 (the notional
+# cap that guarded risk-mode against tight stops) — notional mode needs the
+# opposite guard, against very wide stops.
+#
+# At 4% notional the ceiling only binds above ~33% ATR, which F5's universe
+# never produces, so in practice it is a tripwire for a future config change
+# rather than an active constraint. Kept at 2.0 so RULE 4 keeps meaning the
+# same thing it did in Batch 3.
 MAX_RISK_PER_TRADE_PCT = 2.0
 
 MIN_RR_RATIO = 2.0                      # Guideline (warning if below, not hard reject)
