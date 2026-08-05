@@ -380,6 +380,15 @@ def _to_float(v):
     s = str(v).strip()
     if not s:
         return None
+
+    # PHASE 2.6.3 — Unicode dash normalisation. A cell copied out of a
+    # formatted Sheets range, a PDF, or a chat message can carry U+2212 MINUS
+    # SIGN, U+2013 EN DASH or U+2011 NON-BREAKING HYPHEN instead of ASCII "-".
+    # float() rejects all three, so "−1.00" returned None and the row was
+    # silently dropped from equity — a real loss recorded as no loss at all.
+    for _dash in ("\u2212", "\u2013", "\u2014", "\u2011", "\u2010"):
+        s = s.replace(_dash, "-")
+
     neg = s.startswith("(") and s.endswith(")")
     s = s.strip("()")
     s = s.replace("$", "").replace("R", "").replace("r", "").replace("+", "").strip()
@@ -442,7 +451,14 @@ def read_shadow_rows():
             # trailing empty cells are simply absent from the dict.
             row = {}
             for key, cell in zip(head, raw_row):
-                if key:
+                # PHASE 2.6.3 (B14) — FIRST-WINS on duplicate normalised names.
+                # _normalize() is aggressive by design, so a hand-added column
+                # can collide with a code-written one ("_shadow_date" and a
+                # manual "Date" both -> "date"). Last-wins would silently make
+                # the manual column authoritative for reads. The code-written
+                # block is always leftmost (A..AK), so first-wins keeps the
+                # authoritative column authoritative.
+                if key and key not in row:
                     row[key] = cell
             if any(str(v).strip() for v in row.values()):
                 out.append(row)
@@ -606,9 +622,51 @@ def read_pending(statuses=("PENDING",)):
         if not values or len(values) < 2:
             return []
         head = [_normalize(h) for h in values[0]]
+
+        # ------------------------------------------------------------------
+        # PHASE 2.6.3 — SHORT-HEADER SELF-HEAL (bug B2).
+        #
+        # _ensure_header() is a no-op whenever row 1 has any content, so a tab
+        # created with the ORIGINAL 10-column PENDING_HEADER keeps that header
+        # forever. append_pending() meanwhile writes 11 values (A..K) in
+        # PENDING_HEADER order, so `bar_date` lands in column K with no header
+        # above it. zip(head, raw_row) then stops at the shorter of the two and
+        # DROPS it — the value is written every run and read back never.
+        #
+        # The symptom is invisible: the resolver silently falls back to the
+        # legacy ">= signal_date" anchor, which is the exact defect bar_date
+        # was added to fix. Worse, the documented watch instruction ("check
+        # bar_date is populated") passes, because the CELL is populated — it is
+        # the HEADER that is missing.
+        #
+        # Writes are positional and PENDING_HEADER is strictly append-only, so
+        # position i is PENDING_HEADER[i] by construction. Backfilling the
+        # missing tail names is therefore safe and deterministic. We do NOT
+        # rewrite row 1 (that is what caused the round-1 duplicate-header bug);
+        # we only fix our own in-memory view, and warn loudly.
+        # ------------------------------------------------------------------
+        canonical = [_normalize(h) for h in PENDING_HEADER]
+        if len(head) < len(canonical) and head == canonical[:len(head)]:
+            missing = canonical[len(head):]
+            print(f"[sheets_logger] WARNING: pending tab header has "
+                  f"{len(head)} columns, code writes {len(canonical)}. "
+                  f"Backfilling {missing} positionally. ADD THESE HEADER "
+                  f"CELLS BY HAND — the self-heal is a safety net, not a fix.")
+            head = head + missing
+        elif len(head) < len(canonical):
+            print(f"[sheets_logger] WARNING: pending tab header ({head}) does "
+                  f"not prefix-match PENDING_HEADER ({canonical}). NOT "
+                  f"backfilling — positional assumptions are unsafe here.")
+
         out = []
         for idx, raw_row in enumerate(values[1:], start=2):
-            row = {k: c for k, c in zip(head, raw_row) if k}
+            row = {}
+            for k, c in zip(head, raw_row):
+                # first-wins: the code-written block is leftmost, so a
+                # hand-added column that normalises to the same name must not
+                # shadow it.
+                if k and k not in row:
+                    row[k] = c
             if str(row.get("status", "")).strip().upper() in wanted:
                 row["_row"] = idx
                 out.append(row)
@@ -616,6 +674,44 @@ def read_pending(statuses=("PENDING",)):
     except Exception as e:
         print(f"[sheets_logger] pending read failed: {e}")
         return None
+
+
+def _canon_date(v):
+    """
+    PHASE 2.6.3 (bug B13) — canonicalise a date cell to ISO YYYY-MM-DD.
+
+    update_shadow_rows() matches rows on (ticker, date). The date side comes
+    from ws.get_all_values(), which returns the cell's DISPLAY STRING, not its
+    underlying value. append_shadow_rows() writes with USER_ENTERED, so
+    "2026-08-11" is parsed by Sheets into a real date and re-rendered using
+    whatever format the column carries. Today that round-trips as ISO; the
+    moment anyone applies a date format to the column it becomes "8/11/2026"
+    and EVERY write-back silently misses — entry_type stays "strict" and
+    fallback geometry is never corrected, which is precisely the state Bug 3
+    was fixed to escape.
+
+    Comparing canonical forms instead of raw strings removes the dependency on
+    the sheet's display format entirely.
+
+    Ambiguity note: M/D/YYYY is assumed over D/M/YYYY, consistent with the
+    sheet's confirmed US number locale (period as decimal separator) that
+    _to_float() already relies on. Anything unparseable is returned stripped
+    and lowercased, so an exact string match still works as a last resort.
+    """
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    # already ISO (possibly with a time suffix)
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    # M/D/YYYY or M-D-YYYY (US locale)
+    m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
+    if m:
+        mo, d, y = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    return s.lower()
 
 
 def update_shadow_rows(updates):
@@ -659,7 +755,25 @@ def update_shadow_rows(updates):
             return out
 
         head = [_normalize(h) for h in values[0]]
-        col_of = {name: i for i, name in enumerate(head) if name}
+        # PHASE 2.6.3 (B14) — FIRST-WINS. A dict comprehension is last-wins, so
+        # a hand-added column normalising to an existing name (e.g. a manual
+        # "Stop" next to the code-written "_shadow_stop") would silently
+        # redirect writes into the wrong column. The code-written block is
+        # leftmost, so first occurrence is the authoritative one.
+        col_of = {}
+        dupes = []
+        for i, name in enumerate(head):
+            if not name:
+                continue
+            if name in col_of:
+                dupes.append(name)
+                continue
+            col_of[name] = i
+        if dupes:
+            print(f"[sheets_logger] WARNING: duplicate normalised header "
+                  f"name(s) {sorted(set(dupes))} — writing to the LEFTMOST "
+                  f"occurrence of each. Rename the manual column to remove "
+                  f"the ambiguity.")
 
         if "ticker" not in col_of or "date" not in col_of:
             out["error"] = "shadow log missing ticker/date column"
@@ -672,13 +786,13 @@ def update_shadow_rows(updates):
         for row_no, raw in enumerate(values[1:], start=2):
             if len(raw) <= max(t_idx, d_idx):
                 continue
-            key = (str(raw[t_idx]).strip().upper(), str(raw[d_idx]).strip()[:10])
+            key = (str(raw[t_idx]).strip().upper(), _canon_date(raw[d_idx]))
             index.setdefault(key, []).append(row_no)
 
         cells = []
         for upd in updates:
             ticker = str(upd.get("ticker", "")).strip().upper()
-            sig_date = str(upd.get("signal_date", "")).strip()[:10]
+            sig_date = _canon_date(upd.get("signal_date", ""))
             fields = upd.get("fields") or {}
             matches = index.get((ticker, sig_date), [])
 
