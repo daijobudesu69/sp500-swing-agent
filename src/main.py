@@ -948,7 +948,12 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
     blocked pipeline is a lost trading day.
     """
     out = {"fallbacks": [], "filled": 0, "expired": 0, "checked": 0,
-           "error": None, "shadow_missed": []}
+           "error": None, "shadow_missed": [],
+           # PHASE 2.6.3 (B5): near-misses found too late to execute. Logged
+           # as entry_type "fallback_missed" and surfaced as an ops warning,
+           # because each one is a missed trade caused by an operational gap
+           # (a skipped run), not by the market.
+           "missed_fallbacks": []}
     try:
         pending = sheets_mod.read_pending()
         if pending is None:
@@ -1012,26 +1017,42 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
                 # expire a setup that never got a chance to fill.
                 continue
 
-            if len(after) > expiry_days:
-                sheets_mod.update_pending_status(
-                    row_no, "EXPIRED", run_date,
-                    f"{len(after)} sessions elapsed > expiry {expiry_days}"
-                )
-                out["expired"] += 1
-                shadow_updates.append({
-                    "ticker": ticker, "signal_date": sig_date,
-                    "fields": {"entry_type": "expired", "ema9_filled": "FALSE"},
-                })
-                continue
+            # ------------------------------------------------------------
+            # PHASE 2.6.3 (bug B5) — TWO DIFFERENT QUESTIONS, ANSWERED APART.
+            #
+            # The previous code short-circuited on `len(after) > expiry_days`
+            # and wrote entry_type="expired" / ema9_filled="FALSE" WITHOUT
+            # EVER LOOKING AT THE BAR. That conflates:
+            #
+            #   (a) "did the EMA9 limit actually fill?"   <- a FACT about the
+            #       market, true or false regardless of when we got round to
+            #       reading it
+            #   (b) "may we still execute this at market?" <- an EXECUTION
+            #       rule, and correctly time-limited
+            #
+            # Any missed run — a failed workflow, a rate-limited fetch, a long
+            # holiday — makes `after` two sessions long, and a genuine strict
+            # fill in session 1 was recorded as "expired, never filled". That
+            # corrupts fill-rate AND entry_type, which are the two metrics
+            # Batch 4 exists to measure out-of-sample.
+            #
+            # Session 1 of `after` is the session the order was live in, so it
+            # is always the right bar to read. Staleness only changes what we
+            # are allowed to DO about a near-miss, never what happened.
+            # ------------------------------------------------------------
+            stale = len(after) > expiry_days
 
             bar = after.iloc[0]
             day_low = float(bar["Low"])
             session_date = str(after.index[0].strftime("%Y-%m-%d"))
 
             if day_low <= ema9:
+                # A fill is a fact — recorded even when the row is stale,
+                # because the limit order really did execute that session.
                 sheets_mod.update_pending_status(
                     row_no, "FILLED", run_date,
                     f"session {session_date}: low {day_low:.2f} <= EMA9 {ema9:.2f}"
+                    + (f" [resolved late: {len(after)} sessions elapsed]" if stale else "")
                 )
                 out["filled"] += 1
                 # Strict fill: geometry already correct in the shadow log
@@ -1040,6 +1061,27 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
                 shadow_updates.append({
                     "ticker": ticker, "signal_date": sig_date,
                     "fields": {"entry_type": "strict", "ema9_filled": "TRUE"},
+                })
+            elif zone_high > 0 and day_low <= zone_high and stale:
+                # Near-miss that we are too late to execute at market. The
+                # NEAR-MISS is still recorded (entry_type "fallback_missed"),
+                # because it is exactly the observation ENTRY2_ATR_TOLERANCE
+                # has to be validated against — collapsing it into a plain
+                # "expired" would throw away the only data point that matters
+                # here. It is kept distinct from "fallback" so the two are
+                # never mixed: one was traded, one was not.
+                sheets_mod.update_pending_status(
+                    row_no, "EXPIRED", run_date,
+                    f"session {session_date}: NEAR-MISS (low {day_low:.2f} in "
+                    f"[{ema9:.2f}, {zone_high:.2f}]) but {len(after)} sessions "
+                    f"elapsed > expiry {expiry_days} — not executable"
+                )
+                out["expired"] += 1
+                out["missed_fallbacks"].append(f"{ticker}@{sig_date}")
+                shadow_updates.append({
+                    "ticker": ticker, "signal_date": sig_date,
+                    "fields": {"entry_type": "fallback_missed",
+                               "ema9_filled": "FALSE"},
                 })
             elif zone_high > 0 and day_low <= zone_high:
                 sheets_mod.update_pending_status(
@@ -1070,6 +1112,7 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
                     row_no, "EXPIRED", run_date,
                     f"session {session_date}: low {day_low:.2f} never entered "
                     f"zone (high {zone_high:.2f})"
+                    + (f" [{len(after)} sessions elapsed]" if stale else "")
                 )
                 out["expired"] += 1
                 shadow_updates.append({
@@ -1099,7 +1142,7 @@ def _resolve_pending_entries(run_date: str) -> Dict[str, Any]:
     return out
 
 
-def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
+def _apply_fallback_geometry(run_date: str, skip_tickers=None) -> Dict[str, Any]:
     """
     STAGE 0c (Phase 2.6.1) — the other half of the Bug 3 fix.
 
@@ -1132,6 +1175,14 @@ def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
     Fully non-blocking.
     """
     out = {"applied": 0, "awaiting": 0, "error": None, "missed": []}
+    # PHASE 2.6.3 (bug B7) — a row that STAGE 0 set to FALLBACK seconds ago
+    # cannot possibly have an actual_entry yet: the operator has not even seen
+    # the Stage-2 alert, let alone traded it. Counting those as "awaiting"
+    # fired an ops warning saying their r_realized "will be WRONG" on every
+    # single fallback day, before the operator had done anything wrong. A
+    # warning that cries wolf on its own first day is a warning that gets
+    # ignored on the day it is real.
+    skip = {str(t).strip().upper() for t in (skip_tickers or [])}
     try:
         rows = sheets_mod.read_pending(statuses=("FALLBACK",))
         if rows is None:
@@ -1145,6 +1196,7 @@ def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
         tp2_mult = float(getattr(config, "TP2_R_MULT", 3.0))
 
         updates = []
+        pending_by_key = {}
         for row in rows:
             ticker = str(row.get("ticker", "")).strip().upper()
             fill = _safe_float(row.get("actual_entry"), 0.0)
@@ -1155,7 +1207,8 @@ def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
                 # Operator has not entered the fill yet. Leave FALLBACK so
                 # it is picked up on a later run — never expire it, the
                 # trade may well be open.
-                out["awaiting"] += 1
+                if ticker not in skip:
+                    out["awaiting"] += 1
                 continue
 
             stop = fill - stop_mult * atr
@@ -1174,11 +1227,19 @@ def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
                     "entry_type": "fallback",
                 },
             })
-            sheets_mod.update_pending_status(
-                row["_row"], "EXECUTED", run_date,
-                f"geometry recomputed from fill {fill:.2f} "
-                f"(stop {stop:.2f}, 1R {risk_per_share:.2f})"
-            )
+            # PHASE 2.6.3 (bug B6) — the EXECUTED stamp used to be written
+            # HERE, before update_shadow_rows() had run. If the shadow write
+            # then missed (unmatched (ticker, date), a Sheets 500, a renamed
+            # column), the pending row was already EXECUTED and the geometry
+            # correction could never be retried: the trade kept EMA9-derived
+            # stop/TP forever while the log claimed it had been fixed.
+            # Mark-then-write is the wrong order for any idempotency guard.
+            # The stamp now happens only after a CONFIRMED write, below.
+            pending_by_key[(ticker, sig_date)] = {
+                "row": row["_row"],
+                "note": (f"geometry recomputed from fill {fill:.2f} "
+                         f"(stop {stop:.2f}, 1R {risk_per_share:.2f})"),
+            }
 
         if updates:
             res = sheets_mod.update_shadow_rows(updates)
@@ -1186,6 +1247,25 @@ def _apply_fallback_geometry(run_date: str) -> Dict[str, Any]:
             out["missed"].extend(res.get("missed", []))
             if res.get("error"):
                 out["error"] = res["error"]
+
+            # Only rows whose shadow write is known to have landed get the
+            # EXECUTED stamp. Anything reported in `missed` stays FALLBACK and
+            # will be retried on the next run — an extra attempt is free, a
+            # lost correction is not.
+            missed_keys = set()
+            for m in res.get("missed", []):
+                # missed entries look like "AAPL@2026-08-11 (no row)"
+                head = str(m).split(" ")[0]
+                if "@" in head:
+                    tk, _, dt = head.partition("@")
+                    missed_keys.add((tk.strip().upper(), dt.strip()))
+
+            for (tk, dt), info in pending_by_key.items():
+                if (tk, dt) in missed_keys or res.get("error"):
+                    continue
+                sheets_mod.update_pending_status(
+                    info["row"], "EXECUTED", run_date, info["note"]
+                )
 
         if out["applied"] or out["awaiting"]:
             logger.info(
@@ -1316,6 +1396,15 @@ def run_daily_signals() -> Dict[str, Any]:
                 f"Pending-entry resolution failed: {pending_result['error']}. "
                 f"Two-stage entry is blind this run."
             )
+        if pending_result.get("missed_fallbacks"):
+            ops_warnings.append(
+                f"{len(pending_result['missed_fallbacks'])} near-miss signal(s) "
+                f"were found TOO LATE to execute: "
+                f"{', '.join(pending_result['missed_fallbacks'][:5])}. This means "
+                f"a scheduled run was skipped — the setups are logged "
+                f"`fallback_missed` for the ENTRY2 analysis but were never "
+                f"tradable. Check GitHub Actions for a failed or missed run."
+            )
         if pending_result.get("shadow_missed"):
             ops_warnings.append(
                 f"entry_type write-back could not match "
@@ -1330,7 +1419,12 @@ def run_daily_signals() -> Dict[str, Any]:
         # (Phase 2.6.1). Runs right after resolution so a fill typed in
         # overnight is corrected before anything else reads the log.
         # --------------------------------------------------------
-        geom_result = _apply_fallback_geometry(run_date)
+        geom_result = _apply_fallback_geometry(
+            run_date,
+            # B7: rows this same run has just flipped to FALLBACK cannot have
+            # an actual_entry yet — do not warn about them.
+            skip_tickers=[f.get("ticker") for f in pending_result.get("fallbacks", [])],
+        )
         result["fallback_geometry"] = {
             "applied": geom_result.get("applied", 0),
             "awaiting": geom_result.get("awaiting", 0),
@@ -1719,12 +1813,72 @@ def run_black_swan_check() -> Dict[str, Any]:
         vix_spike_pct = macro_ctx.get("vix_spike_pct", 0.0)
         spy_1d = macro_ctx.get("spy_1d_change_pct", 0.0)  # Opsi X
 
+        # ------------------------------------------------------------------
+        # PHASE 2.6.3 (bug B4) — DO NOT COMPARE THRESHOLDS AGAINST DEFAULTS.
+        #
+        # fetch_market_context() is fail-soft, and every one of its defaults
+        # reads "calm": vix 20.0, vix_spike_pct 0.0, spy_1d_change_pct 0.0.
+        # If BOTH the SPY and VIX fetches fail, this function compared 0.0
+        # against a +30% trigger and -3% trigger, concluded "no event", and
+        # returned SILENTLY — indistinguishable in the log from a genuinely
+        # quiet market.
+        #
+        # That is the identical defect to _compute_weekly_extremes() in Phase
+        # 2.6.1 (§2.7), which reported hardcoded zeros as market data every
+        # week for months. A crash detector whose failure mode is "everything
+        # is fine" is worse than no crash detector, because it is trusted.
+        #
+        # Partial data is still usable: either leg alone can trigger Type A,
+        # so we only go blind when BOTH are missing. That case now ALERTS,
+        # because "I cannot see the market" is itself information the operator
+        # needs during US hours, and a false alarm costs one Telegram message.
+        # The alert is deduped by the same daily marker as a real crash.
+        # ------------------------------------------------------------------
+        spy_ok = bool(macro_ctx.get("spy_data_ok", False))
+        vix_ok = bool(macro_ctx.get("vix_data_ok", False))
+
+        if not spy_ok and not vix_ok:
+            logger.error(
+                "BLACK SWAN WATCHER BLIND — both SPY and VIX fetches failed. "
+                "Threshold comparison skipped: the values available are "
+                "defaults, not measurements."
+            )
+            sent = tg_mod._send_message(
+                "🕳️ *BLACK SWAN WATCHER BLIND*\n\n"
+                "Both the SPY and VIX fetches failed this run, so the crash "
+                "thresholds could not be evaluated at all.\n\n"
+                "This is *not* a statement that the market is calm — the "
+                "watcher simply could not see it. Check the market yourself "
+                "if anything else suggests stress.\n\n"
+                "_Most likely cause: yfinance rate limiting during US market "
+                "hours. Deduped to one message per UTC day._"
+            )
+            if sent:
+                _write_marker(marker_path, run_date)
+            result["status"] = "blind"
+            result["alert_sent"] = sent
+            return result
+
+        if not spy_ok or not vix_ok:
+            logger.warning(
+                f"Black swan watcher DEGRADED (spy_ok={spy_ok}, vix_ok={vix_ok}) "
+                f"— evaluating on the available leg only; the missing side "
+                f"cannot trigger."
+            )
+
         type_a_cfg = getattr(config, "BLACK_SWAN_TYPE_A", {})
         triggers = type_a_cfg.get("triggers", {})
         vix_min = triggers.get("vix_spike_pct_min", 30.0)
         spy_max = triggers.get("spy_drop_pct_max", -3.0)
 
-        is_type_a = (vix_spike_pct >= vix_min) or (spy_1d <= spy_max)
+        # A leg may only fire if its data is REAL. Without this, a failed VIX
+        # fetch leaves vix_spike_pct at its 0.0 default, which cannot trigger —
+        # but a failed SPY fetch leaves spy_1d at 0.0, which also cannot
+        # trigger, and neither absence was visible. Gating each leg on its own
+        # provenance flag makes "did not trigger" mean "the data said no",
+        # never "there was no data".
+        is_type_a = (vix_ok and vix_spike_pct >= vix_min) or \
+                    (spy_ok and spy_1d <= spy_max)
 
         if not is_type_a:
             logger.info(
@@ -1865,6 +2019,11 @@ def run_black_swan_heartbeat() -> Dict[str, Any]:
         heartbeat_path = getattr(config, "BLACK_SWAN_HEARTBEAT_PATH", ".last_heartbeat")
 
         macro_ctx = data_mod.fetch_market_context()
+        if not macro_ctx.get("spy_data_ok") or not macro_ctx.get("vix_data_ok"):
+            logger.warning(
+                "Heartbeat: market context INCOMPLETE — the VIX/SPY figures "
+                "reported below may be fail-soft defaults, not measurements."
+            )
         weekly_extremes = _compute_weekly_extremes()
 
         type_a_cfg = getattr(config, "BLACK_SWAN_TYPE_A", {})
