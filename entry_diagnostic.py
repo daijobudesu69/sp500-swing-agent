@@ -265,9 +265,43 @@ _NO_UNDERSCORE_TO_CANONICAL = {f.lstrip("_"): f for f in _CANONICAL_FIELDS}
 # Restricted to the manual columns ON PURPOSE. Applying bare mapping to
 # every canonical field would make a plain "date" or "stop" column collide
 # with "_shadow_date" / "_shadow_stop". Narrow map, no collisions.
+#
+# PHASE 2.6.3 (bug B19) — THE BARE MAP WAS TOO NARROW.
+#
+# The live sheet's header row uses the "shadow_" prefix for columns A..AC
+# (the pre-2.6 block) and BARE names from AD onwards: "risk_usd",
+# "entry_type", "force_closed", "discretionary_action", "veto_reason",
+# "spy_vs_sma20", "vix_level", "pct_above_50dma", "intended_notional_pct".
+#
+# sheets_logger._normalize() collapses both forms, so the PIPELINE reads them
+# correctly. This module has its own, different normaliser, which recognised
+# only the five MFE columns above — so every Phase 2.6 column arrived as an
+# unknown pass-through key and every analysis that depends on one returned
+# empty. Verified against the 52-row live export:
+#
+#   analyse_entry_type()      -> strict n=0, fallback n=0, unknown n=32
+#   analyse_discretionary()   -> vetoed n=0 (the sheet has 4)
+#   analyse_force_closed()    -> forced n=0
+#   analyse_dollars()         -> counted=0, realized $0.00
+#
+# The worst consequence is in get_taken(): a BLANK action counts as TAKEN by
+# design, and an unreadable action IS blank — so the four VETOED verification
+# rows were being folded into the Batch 4 sample as executed trades. The
+# entire point of the VETOED stamp is to keep them out. Two normalisers that
+# disagree is the same two-sources-of-truth defect as the CSV/Sheet header
+# split, and the answer is the same: make them agree.
+#
+# Still deliberately NARROW. A bare "date" or "stop" would collide with
+# _shadow_date / _shadow_stop, so only names that exist nowhere else in the
+# canonical set are listed.
 _MANUAL_BARE_FIELDS = [
     "_shadow_fill_date", "_shadow_exit_date",
     "_shadow_mfe_price", "_shadow_mfe_r", "_shadow_days_to_mfe",
+    # Phase 2.6 columns, bare in the sheet:
+    "_shadow_risk_usd", "_shadow_entry_type", "_shadow_force_closed",
+    "_shadow_discretionary_action", "_shadow_veto_reason",
+    "_shadow_spy_vs_sma20", "_shadow_vix_level", "_shadow_pct_above_50dma",
+    "_shadow_intended_notional_pct",
 ]
 _BARE_TO_CANONICAL = {f.replace("_shadow_", ""): f for f in _MANUAL_BARE_FIELDS}
 
@@ -438,14 +472,35 @@ def _coerce_row(row: Dict[str, str]) -> Dict[str, Any]:
         except ValueError:
             out[f] = None
 
+    # PHASE 2.6.3 (bug B20) — ACCEPT THE VOCABULARY THE SHEET ACTUALLY USES.
+    #
+    # This accepted only "true"/"false". The live sheet's ema9_filled column
+    # holds "Yes" (32 rows) and "No" (15 rows) — entered by hand long before
+    # the resolver existed — so all 47 coerced to None and were treated as
+    # "not yet filled in". Measured on the live export:
+    #
+    #   analyse_fill_rate() -> filled_n 0, unfilled_n 0, pending_n 52,
+    #                          fill_rate_pct None
+    #
+    # Fill rate is the primary out-of-sample metric Batch 4 exists to
+    # measure, and it was returning nothing at all on a sheet full of data.
+    # Same failure shape as the TIME_TP/TIME_SL omission in WIN_OUTCOMES:
+    # the tool discarded valid rows silently and reported a smaller sample
+    # instead of an error.
+    #
+    # This is not optional going forward either. _resolve_pending_entries()
+    # writes "TRUE"/"FALSE", so from 11 Aug the column is MIXED — Yes/No for
+    # Batch 3, TRUE/FALSE for Batch 4. Any reader must handle both.
+    _TRUEY = {"true", "yes", "y", "1", "t"}
+    _FALSEY = {"false", "no", "n", "0", "f"}
     for f in bool_fields:
         val = str(out.get(f, "")).strip().lower()
-        if val == "true":
+        if val in _TRUEY:
             out[f] = True
-        elif val == "false":
+        elif val in _FALSEY:
             out[f] = False
         else:
-            out[f] = None  # blank = not yet filled in
+            out[f] = None  # genuinely blank = not yet filled in
 
     return out
 
