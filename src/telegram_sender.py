@@ -208,6 +208,33 @@ def _format_soft_warning_line(label: str, value: float, unit: str,
     return f"- {label} — {range_label} {status}\n"
 
 
+def _md_escape(text: Any, limit: int = None) -> str:
+    """
+    PHASE 2.6.3 (bug B16) — neutralise Telegram legacy-Markdown control
+    characters in LLM-authored free text.
+
+    Every production signal run logged `Markdown parse error, retrying as
+    plain text`. The cause is structural, not incidental: `setup_type`,
+    `thesis` and `invalidation` come straight from Opus and are interpolated
+    into a Markdown message — `_{setup}_` in particular. A setup label like
+    "Trend continuation + volume_surge" opens an italic span that never
+    closes, Telegram rejects the whole message, and the retry ships it with
+    NO formatting at all: code-fenced prices, bold tickers and the
+    VERIFICATION banner all silently degrade to plain text on exactly the
+    messages the operator acts on.
+
+    Escaping only the LLM-supplied strings keeps the template's own
+    formatting intact. Applied to free text only — never to numbers, and
+    never to the template.
+    """
+    t = str(text if text is not None else "")
+    if limit is not None:
+        t = t[:limit]
+    for ch in ("_", "*", "`", "["):
+        t = t.replace(ch, "\\" + ch)
+    return t
+
+
 def _format_signal(signal: Dict[str, Any]) -> str:
     """
     Format a single approved signal into a Telegram message.
@@ -224,7 +251,7 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     """
     ticker = signal.get("ticker", "?")
     conviction = int(signal.get("conviction", 0))
-    setup = signal.get("setup_type", "N/A")
+    setup = _md_escape(signal.get("setup_type", "N/A"), 120)
     emoji, tier_label = _conviction_tier(conviction)
 
     entry = float(signal.get("entry", 0))       # Phase 2.3: entry = EMA9
@@ -249,25 +276,61 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     msg += f"TP1:   `${tp1:.2f}` ({tp1_pct:+.2f}%, RR {rr1:.2f})\n"
     msg += f"TP2:   `${tp2:.2f}` ({tp2_pct:+.2f}%, RR {rr2:.2f})\n\n"
 
-    # ── Sizing (Phase 2.6) ──────────────────────────────────
-    # Shows the equity BASIS this signal was sized against and the resulting
-    # dollar risk. Notional is deliberately NOT shown: the operator sizes on
-    # risk, and an extra number here is noise at the moment of execution.
+    # ── Sizing (Phase 2.6 / rewritten 2.6.3) ────────────────
+    # PHASE 2.6.3 (bug B1) — THIS BLOCK WAS NOT UPDATED WHEN SIZING CHANGED.
+    #
+    # It was written for RISK mode, where the operator's input is a dollar
+    # risk and shares follow. Phase 2.6.2 inverted that: notional is now the
+    # input and risk floats. Two things broke and neither showed up in a log:
+    #
+    #   1. `shares` and `position_size_usd` were computed by
+    #      apply_position_sizing() and then never sent anywhere. The operator
+    #      received Entry/Stop/TP and a risk figure, and had to derive the
+    #      share count — the ONE number actually typed into the broker — by
+    #      hand, from a message that did not contain the notional either.
+    #   2. The risk figure was labelled `(2%)`, which is MAX_RISK_PER_TRADE_PCT.
+    #      In notional mode 2% is a ceiling that never binds; real risk runs
+    #      ~0.12-0.34% of equity. The label was off by an order of magnitude.
+    #
+    # Now mode-aware, and always shows the executable numbers first.
     #
     # The basis differs per signal within a run — the waterfall cascade
-    # deducts each signal's risk before sizing the next, so signal #2 is
-    # sized against a smaller basis than #1. Showing the basis makes that
-    # visible instead of looking like an inconsistency.
+    # deducts each signal's notional (cash) before sizing the next, so signal
+    # #2 is sized against a smaller basis than #1. Showing the basis makes
+    # that visible instead of looking like an inconsistency.
     basis = signal.get("_equity_basis")
     risk_usd = signal.get("risk_amount_usd")
     if basis is not None and risk_usd is not None:
         rank = signal.get("_size_rank")
         rank_txt = f" (#{rank})" if rank else ""
+        mode = str(signal.get("_sizing_mode", getattr(config, "SIZING_MODE", "risk"))).lower()
+        shares = signal.get("shares")
+        notional = signal.get("position_size_usd")
+        basis_f = float(basis)
+        risk_f = float(risk_usd)
+        risk_pct_actual = (risk_f / basis_f * 100) if basis_f > 0 else 0.0
+
         msg += f"📐 *Sizing*{rank_txt}\n"
-        msg += f"Basis: `${float(basis):.2f}` → Risk: `${float(risk_usd):.2f}`"
-        msg += f" ({config.MAX_RISK_PER_TRADE_PCT}%)\n"
+        if shares is not None:
+            msg += f"Shares: `{float(shares):.5f}`\n"
+        if notional is not None:
+            notional_f = float(notional)
+            notional_pct = (notional_f / basis_f * 100) if basis_f > 0 else 0.0
+            msg += f"Notional: `${notional_f:.2f}` ({notional_pct:.1f}% of equity)\n"
+        msg += f"Risk: `${risk_f:.2f}` ({risk_pct_actual:.2f}% of equity)\n"
+        msg += f"Basis: `${basis_f:.2f}`\n"
+
         if signal.get("_risk_capped"):
-            msg += "⚠️ Risk below budget — stop tighter than risk %\n"
+            # PHASE 2.6.3 (bug B12): this line used to read "Risk below budget
+            # — stop tighter than risk %" in BOTH modes. In notional mode
+            # _risk_capped means the exact opposite: the stop was so WIDE that
+            # implied risk breached the ceiling and the position was scaled
+            # DOWN. Same flag, inverted meaning, so the text has to branch.
+            if mode == "notional":
+                msg += (f"⚠️ Position scaled DOWN — wide stop would have "
+                        f"breached the {config.MAX_RISK_PER_TRADE_PCT}% risk ceiling\n")
+            else:
+                msg += "⚠️ Risk below budget — stop tighter than risk %\n"
         msg += "\n"
 
     # ── Mandatory filters (all 5 passed by definition) ──────
@@ -343,16 +406,16 @@ def _format_signal(signal: Dict[str, Any]) -> str:
         msg += f"{config.WARNING_EMOJI} Warnings: None\n\n"
 
     # ── Thesis ───────────────────────────────────────────────
-    thesis = signal.get("thesis", "")
+    thesis = _md_escape(signal.get("thesis", ""), 400)
     if thesis:
-        msg += f"💭 *Thesis*\n{thesis[:400]}\n\n"
+        msg += f"💭 *Thesis*\n{thesis}\n\n"
 
     # ── Invalidation ─────────────────────────────────────────
     invalidation = signal.get("invalidation", [])
     if invalidation:
         msg += "❌ *Invalidation*\n"
         for inv in invalidation[:3]:
-            msg += f"- {inv}\n"
+            msg += f"- {_md_escape(inv, 200)}\n"
 
     return msg
 
