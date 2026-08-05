@@ -80,7 +80,7 @@ API DETAILS:
   Multiple signals = multiple messages (no combining)
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -159,7 +159,7 @@ def send_test_message() -> bool:
     """Quick connectivity test."""
     return _send_message(
         f"✅ *Test message*\nSP500 Swing Agent connected.\n"
-        f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
 
@@ -384,7 +384,7 @@ def send_daily_signals(
         logger.warning("send_daily_signals called with empty list")
         return False
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Header message
     header = f"{config.SIGNAL_HEADER_EMOJI} *DAILY SIGNALS — {today}*\n\n"
@@ -604,7 +604,7 @@ def send_no_signal_day(
     macro: Dict[str, Any],
 ) -> bool:
     """Send explanation message when no signals qualify."""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     msg = f"{config.NO_SIGNAL_EMOJI} *No Signal — {today}*\n\n"
     msg += _format_macro_header(macro) + "\n\n"
@@ -632,7 +632,7 @@ def send_black_swan_crash(event_summary: Dict[str, Any]) -> bool:
       headlines          — list of headline strings (possibly empty)
       headline_source    — "keyword" | "general" | "none"
     """
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     msg = f"{config.BLACK_SWAN_CRASH_EMOJI} *BLACK SWAN — TYPE A: CRASH*\n"
     msg += f"_{timestamp}_\n\n"
@@ -686,7 +686,7 @@ def send_black_swan_heartbeat(event_summary: Dict[str, Any]) -> bool:
       spy_threshold        — float (Type A SPY trigger, e.g. -3.0)
       vix_threshold        — float (Type A VIX trigger, e.g. 30.0)
     """
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     vix_now = event_summary.get("vix_now", 0.0)
     spy_now = event_summary.get("spy_price_now", 0.0)
