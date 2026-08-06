@@ -567,6 +567,44 @@ check("unbalanced italic span no longer emitted",
 check("thesis asterisk escaped", r"\*and\*" in _dmsg)
 check("invalidation escaped", r"95\_00" in _dmsg)
 
+# ------------------------------------------------------------
+# B21 (found post-deploy, 6 Aug 2026) — _tier1_rr_warning carries Opus's
+# OWN free text (tier_1_fail_reason) through an INDIRECT path: Opus ->
+# risk_manager.py builds a warning string -> telegram_sender.py prints it.
+# B16 only escaped the three DIRECT fields (setup_type/thesis/invalidation)
+# and missed this one. A live run on 6 Aug 2026, on a commit that already
+# had B16, still hit "Markdown parse error, retrying as plain text" —
+# this gap is the most likely explanation.
+# ------------------------------------------------------------
+print("\n=== B21: risk-manager warning strings are Markdown-escaped ===")
+
+_tier_dirty = dict(_sig)
+_tier_dirty["_tier1_rr_warning"] = "TIER 1 soft fail (RR): setup_type mismatch_at_entry — review"
+_tmsg = _tg._format_signal(_tier_dirty)
+check("tier1 warning (Opus-derived text) is escaped",
+      r"setup\_type mismatch\_at\_entry" in _tmsg,
+      "this is the exact class of bug B16 was meant to close")
+check("raw unescaped tier1 text does NOT leak through",
+      "setup_type mismatch_at_entry" not in _tmsg)
+
+_rr_dirty = dict(_sig)
+_rr_dirty["_rr_warning"] = "RR 1.80 below 2.0:1 guideline"
+_conv_dirty = dict(_sig)
+_conv_dirty["_conviction_warning"] = "Conviction 62 below 65 reference threshold"
+check("rr_warning survives escaping (no LLM text, but must not crash)",
+      "RR 1.80 below 2.0:1 guideline" in _tg._format_signal(_rr_dirty))
+check("conviction_warning survives escaping (no LLM text, but must not crash)",
+      "Conviction 62 below 65 reference threshold" in _tg._format_signal(_conv_dirty))
+
+# risk_manager.py itself never assigns _sizing_warning (RULE 4 is a hard
+# gate again as of Phase 2.6) — confirm that's still true, since this test
+# suite is the thing that would catch it if RULE 4 were ever softened back
+# and _sizing_warning started carrying live content again unescaped.
+_rm_src = open("src/risk_manager.py").read()
+check("_sizing_warning is still dead code (RULE 4 is a hard gate)",
+      '"_sizing_warning"] = ' not in _rm_src,
+      "if this ever fires, re-check whether it can carry LLM text and needs the same escaping")
+
 
 # ------------------------------------------------------------
 # B17 — Unicode minus silently dropped rows from equity
