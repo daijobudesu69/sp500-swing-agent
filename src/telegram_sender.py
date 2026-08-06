@@ -386,10 +386,29 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     # ── Risk manager warnings ────────────────────────────────
     # CHANGED (June 2026): added _sizing_warning and _conviction_warning —
     # see module docstring "WARNING DISPLAY FIX" for why these two exist now.
-    rr_warn = signal.get("_rr_warning", "")
-    tier_warn = signal.get("_tier1_rr_warning", "")
-    sizing_warn = signal.get("_sizing_warning", "")
-    conviction_warn = signal.get("_conviction_warning", "")
+    #
+    # PHASE 2.6.3 (bug B21, found post-deploy 6 Aug 2026) — _tier1_rr_warning
+    # is built in risk_manager.py from `tier_1_fail_reason`, which is Opus's
+    # OWN free-text output (see analyst.py DEEP_SYSTEM_PROMPT's TIER 1 veto
+    # field). That makes it exactly the same hazard class as setup_type /
+    # thesis / invalidation, which B16 escaped — but this one arrives at
+    # the Telegram formatter through an indirect path (Opus -> risk_manager
+    # -> a warning string -> here), so it was missed when B16 was scoped to
+    # only the three obvious direct fields. A production run on 6 Aug 2026
+    # hit "Markdown parse error, retrying as plain text" on a commit that
+    # already had B16 applied — this gap is the most likely explanation.
+    #
+    # _rr_warning and _conviction_warning are built entirely from config
+    # constants and numbers (verified against risk_manager.py source, no
+    # LLM text), so they were never actually unsafe. _sizing_warning is
+    # currently dead code — RULE 4 was restored to a hard gate in Phase 2.6,
+    # so nothing assigns this key anymore. All four are escaped anyway:
+    # the cost is negligible, and it removes the need to re-verify this
+    # every time risk_manager.py's warning logic changes.
+    rr_warn = _md_escape(signal.get("_rr_warning", ""), 300)
+    tier_warn = _md_escape(signal.get("_tier1_rr_warning", ""), 300)
+    sizing_warn = _md_escape(signal.get("_sizing_warning", ""), 300)
+    conviction_warn = _md_escape(signal.get("_conviction_warning", ""), 300)
     warnings_text = ""
     if rr_warn:
         warnings_text += f"- {rr_warn}\n"
