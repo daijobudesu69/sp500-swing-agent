@@ -210,6 +210,24 @@ HAIKU IS NOW RANK-ONLY:
   sizing. Honest caveat: the score failed Benjamini-Hochberg on Batch 3, so
   as a ranker it is close to arbitrary — it is used because it is already
   there and adds no new code, not because it is known to work.
+
+PHASE 2.6.4 — OPS-WARNING TEXT IS NOW PLAIN TEXT (11 August 2026):
+====================================================================
+telegram_sender.send_ops_warnings() now sends with parse_mode="" after
+bug B22: the ops-warning message carried an odd number of bare underscores
+(r_realized, risk_usd) from the strings built in THIS file, which broke
+Telegram's Markdown parsing and shipped the whole message unformatted.
+
+The consequence here is small but real: any Markdown markup embedded in an
+ops-warning string is now rendered literally. Three strings in this file
+wrapped a column name in backticks for emphasis; those backticks would have
+appeared as literal characters. They have been removed.
+
+RULE GOING FORWARD — ops-warning strings are PLAIN TEXT. Do not add
+backticks, asterisks or underscores for emphasis to anything appended to
+`ops_warnings`. Column and field names go in bare (risk_usd, entry_type,
+actual_entry). This costs nothing: the message is a diagnostic, and it is
+now immune to the parse failures that formatting was causing.
 """
 import csv
 import logging
@@ -820,10 +838,13 @@ def _resolve_equity() -> Dict[str, Any]:
         # keeps the two-track split honest — silence here would mean either
         # paper P&L moving real capital, or real P&L going missing, and
         # neither has any other visible symptom.
+        #
+        # PHASE 2.6.4: backticks removed around the column name — ops
+        # warnings are plain text now (see module docstring).
         unmarked = meta.get("unmarked_rows") or []
         if unmarked:
             out["warnings"].append(
-                f"{len(unmarked)} CLOSED row(s) have no `discretionary_action`: "
+                f"{len(unmarked)} CLOSED row(s) have no discretionary_action: "
                 f"{', '.join(str(t) for t in unmarked[:5])}. They are EXCLUDED "
                 f"from equity. Mark each TAKEN / MODIFIED / VETOED — if any was "
                 f"really executed, the balance below is understated."
@@ -908,6 +929,11 @@ def _flush_ops_warnings(warnings: List[str]) -> None:
     Called on every exit path — including early returns from a macro veto or
     a total risk-validation rejection. A stale-equity warning matters MORE on
     a no-signal day, because nothing else in the message would reveal it.
+
+    PHASE 2.6.4: the receiving function sends this as PLAIN TEXT (bug B22).
+    Every string appended to `ops_warnings` anywhere in this module must
+    therefore be free of Markdown markup — no backticks, no asterisks, no
+    underscores used as emphasis. Bare column names are correct.
     """
     if not warnings:
         return
@@ -1396,13 +1422,15 @@ def run_daily_signals() -> Dict[str, Any]:
                 f"Pending-entry resolution failed: {pending_result['error']}. "
                 f"Two-stage entry is blind this run."
             )
+        # PHASE 2.6.4: backticks removed around fallback_missed — ops
+        # warnings are plain text now (see module docstring).
         if pending_result.get("missed_fallbacks"):
             ops_warnings.append(
                 f"{len(pending_result['missed_fallbacks'])} near-miss signal(s) "
                 f"were found TOO LATE to execute: "
                 f"{', '.join(pending_result['missed_fallbacks'][:5])}. This means "
                 f"a scheduled run was skipped — the setups are logged "
-                f"`fallback_missed` for the ENTRY2 analysis but were never "
+                f"fallback_missed for the ENTRY2 analysis but were never "
                 f"tradable. Check GitHub Actions for a failed or missed run."
             )
         if pending_result.get("shadow_missed"):
@@ -1429,10 +1457,12 @@ def run_daily_signals() -> Dict[str, Any]:
             "applied": geom_result.get("applied", 0),
             "awaiting": geom_result.get("awaiting", 0),
         }
+        # PHASE 2.6.4: backticks removed around actual_entry — ops warnings
+        # are plain text now (see module docstring).
         if geom_result.get("awaiting"):
             ops_warnings.append(
                 f"{geom_result['awaiting']} fallback trade(s) still have no "
-                f"`actual_entry` in the pending tab. Until you enter the real "
+                f"actual_entry in the pending tab. Until you enter the real "
                 f"fill price, their shadow-log stop/TP remain EMA9-based and "
                 f"their r_realized will be WRONG."
             )
