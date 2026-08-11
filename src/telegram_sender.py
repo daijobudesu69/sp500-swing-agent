@@ -65,9 +65,66 @@ ADDED:
     blocked. Without this change, those two warnings only ever showed up
     in GitHub Actions logs, never in the message the user actually reads.
 
+PHASE 2.6.4 — MARKDOWN HAZARD, THIRD PASS (11 August 2026):
+=============================================================
+Batch 4 day 1 logged `Markdown parse error, retrying as plain text` on a
+commit that already carried BOTH the B16 and B21 fixes. Root cause found
+in the one Telegram path neither fix was ever scoped to.
+
+B22 — send_ops_warnings() had no escaping at all.
+  The 11 Aug OPS WARNINGS message carried three bare underscores from
+  main.py's own warning templates (`r_realized`, `risk_usd`, `risk_usd`
+  in the skipped_no_risk warning). Three is odd, so the header's
+  `_Signals above are still valid._` italic span never closed and
+  Telegram rejected the whole message. Confirmed against the delivered
+  message: `*OPS WARNINGS*` and the italic line both rendered literal,
+  while the "No Signal" message sent seconds earlier rendered correctly.
+
+  FIX — this function now sends with parse_mode="" (plain text), and its
+  own markup has been stripped so nothing renders as stray punctuation.
+
+  WHY PLAIN TEXT RATHER THAN ESCAPING. Ops warnings are the only Telegram
+  path that interpolates RAW EXCEPTION TEXT:
+
+      f"Pending-entry resolution failed: {pending_result['error']}"   # str(e)[:200]
+      f"Sheets equity read FAILED ({meta.get('error', 'unknown')})"   # str(e)
+
+  An APIError string is arbitrary and can contain any character. Escaping
+  only ever closes the hazards already enumerated — which is exactly how
+  B16 missed B21, and how B21 missed this. It also cannot be maintained:
+  every future ops_warnings.append() would silently inherit an unwritten
+  rule about backticks and underscores.
+
+  The trade being made deliberately: this message loses bold/italic. That
+  is worth close to nothing here — it is a diagnostic read by one operator
+  — while guaranteed delivery is worth a great deal, because this is the
+  message that fires precisely when something else is already broken. B16
+  and B21 made the opposite trade for signal messages, correctly: those
+  need formatting, and their inputs are LLM prose, not exception text.
+
+  NOTE (cosmetic, main.py): the missed_fallbacks warning wraps
+  `fallback_missed` in backticks. Under plain text those now show as
+  literal backtick characters. Harmless; strip them in main.py whenever
+  that string is next touched.
+
+B23 — send_black_swan_crash() interpolated raw RSS headlines.
+  `msg += f"- {h[:110]}\n"` — same hazard class as B16, on third-party
+  text nobody controls. Never triggered only because Type A has not fired
+  in production; a single headline containing an underscore or asterisk
+  would have degraded the crash alert to plain text.
+
+  FIX — headlines now pass through _md_escape(h, 110).
+
+  Plain text is NOT the right answer here, unlike B22: a crash alert has
+  to be scannable in seconds, so the formatting is load-bearing. Escaping
+  the untrusted field while keeping the template's own markup is the
+  correct trade for this message.
+
 FUNCTIONS:
   send_daily_signals()         — Main signal delivery (header + each signal)
   send_shadow_log()            — Shadow log summary (after daily signals)
+  send_stage2_alerts()         — Two-stage entry (Stage 2) market-on-open alert
+  send_ops_warnings()          — Batched operational warnings (PLAIN TEXT, see B22)
   send_no_signal_day()         — Explain why no signals fired
   send_black_swan_crash()      — Type A alert (alert-only, no LLM, no ideas)
   send_black_swan_heartbeat()  — Weekly liveness + keepalive message
@@ -105,6 +162,16 @@ def _send_message(
     """
     Send a single Telegram message via Bot API.
     Returns True on success, False on failure.
+
+    parse_mode semantics:
+      None  -> use config.TELEGRAM_PARSE_MODE (default "Markdown")
+      ""    -> send as PLAIN TEXT, no entity parsing (see B22)
+      other -> passed through verbatim
+
+    The empty-string case is not a quirk: it is the same value the
+    parse-error retry path below already sets, so it is a proven code
+    path, and it is how send_ops_warnings() opts out of Markdown
+    entirely.
     """
     token = config.TELEGRAM_BOT_TOKEN
     chat_id = config.TELEGRAM_CHAT_ID
@@ -226,6 +293,16 @@ def _md_escape(text: Any, limit: int = None) -> str:
     Escaping only the LLM-supplied strings keeps the template's own
     formatting intact. Applied to free text only — never to numbers, and
     never to the template.
+
+    PHASE 2.6.4 (bug B23) — scope widened beyond LLM text. RSS headlines
+    in send_black_swan_crash() are third-party strings nobody controls and
+    belong to the same hazard class. "LLM-authored" was never the actual
+    boundary; "not written by this template" is.
+
+    LIMIT OF THIS APPROACH: it closes the hazards enumerated in the tuple
+    below and nothing else. Where the interpolated value is a raw exception
+    string (ops warnings), escaping is the wrong tool — send that message
+    as plain text instead. See B22 in the module docstring.
     """
     t = str(text if text is not None else "")
     if limit is not None:
@@ -397,6 +474,12 @@ def _format_signal(signal: Dict[str, Any]) -> str:
     # only the three obvious direct fields. A production run on 6 Aug 2026
     # hit "Markdown parse error, retrying as plain text" on a commit that
     # already had B16 applied — this gap is the most likely explanation.
+    #
+    # PHASE 2.6.4 FOOTNOTE: B21 was NOT the whole story. The 11 Aug run hit
+    # the same log line on a commit carrying both fixes — the remaining path
+    # was send_ops_warnings(), which had no escaping at all (B22). Twice now
+    # the fix has been scoped to "the fields we can see from here". That
+    # pattern, not any individual field, is the defect.
     #
     # _rr_warning and _conviction_warning are built entirely from config
     # constants and numbers (verified against risk_manager.py source, no
@@ -597,6 +680,10 @@ def send_stage2_alerts(fallbacks: List[Dict[str, Any]], run_date: str) -> bool:
     missing the strongest continuations. ENTRY2_ATR_TOLERANCE = 0.15 is an
     IN-SAMPLE fit on 5 observed near-misses and catches 2 of them — it is
     provisional, and this alert path is how it gets tested out-of-sample.
+
+    MARKDOWN NOTE (2.6.4): every interpolated value here is a ticker, a
+    date, or a formatted number — no free text, no exception strings. This
+    message is safe under Markdown and is deliberately left formatted.
     """
     if not fallbacks:
         return False
@@ -671,21 +758,64 @@ def send_ops_warnings(warnings: List[str]) -> bool:
 
     Sent on EVERY exit path, including no-signal days. A stale-equity warning
     matters more on a quiet day, because nothing else would reveal it.
+
+    ------------------------------------------------------------------
+    PHASE 2.6.4 (bug B22) — SENT AS PLAIN TEXT, DELIBERATELY.
+    ------------------------------------------------------------------
+    This function previously interpolated every warning raw into a Markdown
+    message. On 11 Aug 2026 the skipped_no_risk warning contributed three
+    bare underscores (`r_realized`, `risk_usd`, `risk_usd`); three is odd,
+    so the header's italic span never closed, Telegram rejected the message,
+    and the retry path shipped it unformatted anyway. The delivered message
+    shows `*OPS WARNINGS*` and the italic line as literal characters.
+
+    Escaping was considered and rejected. Two of the warnings assembled in
+    main.py carry RAW EXCEPTION TEXT (`str(e)[:200]` from the pending-tab
+    read; the Sheets error string from read_equity's meta). Those are
+    arbitrary. An escape list closes the characters someone remembered to
+    enumerate — which is precisely how B16 missed B21 and how B21 missed
+    this — and it silently imposes an unwritten rule on every future
+    ops_warnings.append() call site.
+
+    The trade: this message loses bold and italic. That costs almost
+    nothing (one operator, diagnostic content) and buys guaranteed
+    delivery on the one message that fires exactly when something else has
+    already broken. Signal messages make the opposite trade correctly —
+    they need formatting, and their untrusted inputs are LLM prose, which
+    _md_escape() handles well.
+
+    All markup has been stripped from this function's own template as part
+    of the change; leaving `*OPS WARNINGS*` in place would render the
+    asterisks literally.
+
+    KNOWN COSMETIC (main.py, not fixed here): the missed_fallbacks warning
+    wraps `fallback_missed` in backticks, which now show as literal
+    backtick characters. Harmless — strip them next time that string is
+    edited.
     """
     if not warnings:
         return False
-    msg = "🛠️ *OPS WARNINGS*\n"
-    msg += "_Signals above are still valid — but check these first._\n\n"
+    msg = "🛠️ OPS WARNINGS\n"
+    msg += "Signals above are still valid — but check these first.\n\n"
     for w in warnings:
         msg += f"• {w}\n\n"
-    return _send_message(msg)
+    return _send_message(msg, parse_mode="")
 
 
 def send_no_signal_day(
     reason: str,
     macro: Dict[str, Any],
 ) -> bool:
-    """Send explanation message when no signals qualify."""
+    """
+    Send explanation message when no signals qualify.
+
+    MARKDOWN NOTE (2.6.4): `reason` is assembled in main.py from templates
+    plus ticker/score tuples — currently free of control characters, which
+    is why this message rendered correctly on 11 Aug while the ops-warning
+    message in the same run did not. That is a property of the current
+    strings, not a guarantee. If a reason string ever comes to carry LLM or
+    exception text, wrap it in _md_escape() here.
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     msg = f"{config.NO_SIGNAL_EMOJI} *No Signal — {today}*\n\n"
@@ -713,6 +843,19 @@ def send_black_swan_crash(event_summary: Dict[str, Any]) -> bool:
       market_moves      — dict of label -> formatted string (VIX, SPY today)
       headlines          — list of headline strings (possibly empty)
       headline_source    — "keyword" | "general" | "none"
+
+    PHASE 2.6.4 (bug B23) — headlines are RSS strings from third-party
+    publishers, interpolated raw into a Markdown message. Identical hazard
+    class to B16's LLM fields; the only reason it never fired is that Type A
+    has not triggered in production. One headline containing an unbalanced
+    underscore or asterisk would have degraded the crash alert to plain
+    text — on the single message in this system where fast, scannable
+    formatting matters most.
+
+    Escaped rather than sent plain (unlike ops warnings, B22): here the
+    formatting is load-bearing, and the untrusted input is prose, which
+    _md_escape() handles reliably. market_moves values are built in main.py
+    from formatted floats and stay unescaped.
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -733,7 +876,7 @@ def send_black_swan_crash(event_summary: Dict[str, Any]) -> bool:
         else:
             msg += "📰 *Possible context* (general market headlines)\n"
         for h in headlines[:5]:
-            msg += f"- {h[:110]}\n"
+            msg += f"- {_md_escape(h, 110)}\n"
         msg += "\n"
         msg += "⚠️ *News can't be verified — do your own research NOW.*\n"
         msg += "_Cause not confirmed by the system; headlines are context only._\n\n"
@@ -767,6 +910,9 @@ def send_black_swan_heartbeat(event_summary: Dict[str, Any]) -> bool:
       max_vix_spike_pct    — float (largest single-day VIX spike this week)
       spy_threshold        — float (Type A SPY trigger, e.g. -3.0)
       vix_threshold        — float (Type A VIX trigger, e.g. 30.0)
+
+    MARKDOWN NOTE (2.6.4): every interpolated value is a float formatted by
+    this function. No untrusted text reaches this template.
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -898,15 +1044,41 @@ if __name__ == "__main__":
     mock_shadow_msg = send_shadow_log([mock_signal], "2026-06-01")
     print(f"Shadow log sent: {mock_shadow_msg}")
 
-    print("\n=== Mock Black Swan Crash (keyword) ===")
+    # ----------------------------------------------------------
+    # PHASE 2.6.4 — B22 reproduction.
+    # These are verbatim copies of the two warning strings main.py built on
+    # 11 Aug 2026. Together they carry an odd number of bare underscores,
+    # which is what broke the message under Markdown. Under the plain-text
+    # path this must now send successfully every time.
+    # ----------------------------------------------------------
+    print("\n=== Mock Ops Warnings (B22 repro — 11 Aug 2026 strings) ===")
+    mock_ops = [
+        "32 closed row(s) have r_realized but no risk_usd — their P&L is "
+        "INVISIBLE to equity. Backfill risk_usd.",
+        "1 near-miss signal(s) were found TOO LATE to execute: "
+        "NTAP@2026-08-06. This means a scheduled run was skipped — the "
+        "setups are logged `fallback_missed` for the ENTRY2 analysis but "
+        "were never tradable. Check GitHub Actions for a failed or missed run.",
+        "Pending-entry resolution failed: APIError: [403]: The caller does "
+        "not have permission. Two-stage entry is blind this run.",
+    ]
+    print(f"Ops warnings sent: {send_ops_warnings(mock_ops)}")
+
+    # ----------------------------------------------------------
+    # PHASE 2.6.4 — B23 reproduction.
+    # A headline with an unbalanced underscore and an asterisk. Before the
+    # fix this message would have been rejected by Telegram and re-sent
+    # with no formatting at all.
+    # ----------------------------------------------------------
+    print("\n=== Mock Black Swan Crash (keyword, B23 repro) ===")
     mock_crash_event = {
         "market_moves": {
             "VIX": "34.20 (+31.5% intraday)",
             "SPY today": "-3.40% (1d)",
         },
         "headlines": [
-            "Markets tumble as Fed signals emergency rate concerns",
-            "Bank stocks slide amid contagion fears",
+            "Markets tumble as Fed signals emergency rate_cut concerns",
+            "Bank stocks slide amid *contagion* fears",
         ],
         "headline_source": "keyword",
     }
